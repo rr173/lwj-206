@@ -460,6 +460,8 @@ function createApiRouter(wss) {
       [id, incidentId, responseSpeed, collaboration, rootCauseAccuracy, improvementSuggestions || null, summary || null]);
     const review = runQuery(db, 'SELECT * FROM incident_reviews WHERE id = ?', [id])[0];
     addLog(db, incidentId, req.body.userName || 'system', 'submit_review', 'review', id, null);
+    broadcast(incidentId, { type: 'review_submitted', review });
+    pushSync(db, incidentId, 'review_submitted', { review });
     res.status(201).json(review);
   });
 
@@ -506,7 +508,7 @@ function createApiRouter(wss) {
     const templateId = crypto.randomUUID();
     runExec(db, 'INSERT INTO incident_templates (id, name, source_incident_id) VALUES (?, ?, ?)',
       [templateId, templateName, incidentId]);
-    const nodes = runQuery(db, 'SELECT * FROM timeline_nodes WHERE incident_id = ? ORDER BY occurred_at ASC, sequence ASC', [incidentId]);
+    const nodes = runQuery(db, 'SELECT * FROM timeline_nodes WHERE incident_id = ? AND is_excluded = 0 ORDER BY occurred_at ASC, sequence ASC', [incidentId]);
     const startMs = new Date(inc.start_time).getTime();
     nodes.forEach((n, i) => {
       const offsetSec = Math.round((new Date(n.occurred_at).getTime() - startMs) / 1000);

@@ -312,12 +312,16 @@ header h1 { font-size: 18px; font-weight: 600; display: flex; align-items: cente
 .stats-chart-container {
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
   padding: 24px; width: 100%; max-width: 900px;
+  box-sizing: border-box; overflow: hidden;
 }
 .stats-chart-container h2 {
   font-size: 15px; font-weight: 600; margin-bottom: 16px;
 }
 .stats-chart-container canvas {
-  width: 100%; max-width: 800px;
+  width: 100% !important;
+  max-width: 100%;
+  display: block;
+  height: auto;
 }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }

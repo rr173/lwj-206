@@ -1083,6 +1083,13 @@ function handleWSMessage(msg) {
       refreshIncident();
       render();
       break;
+    case 'review_submitted':
+      state.currentReview = msg.review;
+      state.showReviewForm = false;
+      refreshLogs();
+      showToast('收到其他协作者提交的复盘评分');
+      render();
+      break;
   }
 }
 
@@ -1181,12 +1188,19 @@ function renderStatsChart() {
   const stats = state.reviewStats;
   if (!stats || !stats.monthly || stats.monthly.length === 0) return;
 
+  const container = canvas.parentElement;
+  const PADDING_INNER = 48;
+  const containerW = container.clientWidth - PADDING_INNER;
+  const aspectRatio = 800 / 350;
+  const W = Math.max(containerW, 320);
+  const H = Math.round(W / aspectRatio);
+
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = 800 * dpr;
-  canvas.height = 350 * dpr;
-  canvas.style.width = '800px';
-  canvas.style.height = '350px';
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
   ctx.scale(dpr, dpr);
 
   const monthly = stats.monthly;
@@ -1198,16 +1212,18 @@ function renderStatsChart() {
     { key: 'avg_overall', label: '综合', color: '#22c55e' }
   ];
 
-  const W = 800, H = 350;
-  const PAD_L = 50, PAD_R = 100, PAD_T = 30, PAD_B = 50;
+  const scale = W / 800;
+  const PAD_L = Math.round(50 * scale), PAD_R = Math.round(100 * scale);
+  const PAD_T = Math.round(30 * scale), PAD_B = Math.round(50 * scale);
   const chartW = W - PAD_L - PAD_R;
   const chartH = H - PAD_T - PAD_B;
 
-  ctx.fillStyle = '#0f172a';
+  ctx.fillStyle = '#1e293b';
   ctx.fillRect(0, 0, W, H);
 
   ctx.strokeStyle = '#334155';
   ctx.lineWidth = 0.5;
+  const fontSize = Math.max(10, Math.round(11 * scale));
   for (let i = 0; i <= 5; i++) {
     const y = PAD_T + chartH - (i / 5) * chartH;
     ctx.beginPath();
@@ -1215,13 +1231,13 @@ function renderStatsChart() {
     ctx.lineTo(PAD_L + chartW, y);
     ctx.stroke();
     ctx.fillStyle = '#94a3b8';
-    ctx.font = '11px sans-serif';
+    ctx.font = fontSize + 'px sans-serif';
     ctx.textAlign = 'right';
     ctx.fillText(i.toString(), PAD_L - 8, y + 4);
   }
 
   ctx.fillStyle = '#94a3b8';
-  ctx.font = '11px sans-serif';
+  ctx.font = fontSize + 'px sans-serif';
   ctx.textAlign = 'center';
   labels.forEach((l, i) => {
     const x = PAD_L + (i / Math.max(labels.length - 1, 1)) * chartW;
@@ -1230,7 +1246,7 @@ function renderStatsChart() {
 
   datasets.forEach(ds => {
     ctx.strokeStyle = ds.color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = Math.max(1.5, 2 * scale);
     ctx.beginPath();
     monthly.forEach((m, i) => {
       const x = PAD_L + (i / Math.max(monthly.length - 1, 1)) * chartW;
@@ -1244,19 +1260,20 @@ function renderStatsChart() {
       const y = PAD_T + chartH - ((m[ds.key] || 0) / 5) * chartH;
       ctx.fillStyle = ds.color;
       ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.arc(x, y, Math.max(3, 4 * scale), 0, Math.PI * 2);
       ctx.fill();
     });
   });
 
   datasets.forEach((ds, i) => {
-    const y = PAD_T + 20 + i * 20;
+    const step = Math.round(20 * scale);
+    const y = PAD_T + step + i * step;
     ctx.fillStyle = ds.color;
-    ctx.fillRect(PAD_L + chartW + 15, y, 12, 12);
+    ctx.fillRect(PAD_L + chartW + Math.round(15 * scale), y, Math.round(12 * scale), Math.round(12 * scale));
     ctx.fillStyle = '#94a3b8';
-    ctx.font = '11px sans-serif';
+    ctx.font = fontSize + 'px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(ds.label, PAD_L + chartW + 32, y + 10);
+    ctx.fillText(ds.label, PAD_L + chartW + Math.round(32 * scale), y + Math.round(10 * scale));
   });
 }
 
