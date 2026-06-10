@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  timeline:
+    build: .
+    ports:
+      - "3033:3033"
+    environment:
+      - PORT=3033
+    volumes:
+      - timeline-data:/app/data
+    restart: unless-stopped
+volumes:
+  timeline-data:
