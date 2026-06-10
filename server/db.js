@@ -130,6 +130,37 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS incident_templates (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      source_incident_id TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS template_nodes (
+      id TEXT PRIMARY KEY,
+      template_id TEXT NOT NULL,
+      offset_seconds INTEGER NOT NULL,
+      source_type TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      description_template TEXT NOT NULL,
+      sequence INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS incident_reviews (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL UNIQUE,
+      response_speed INTEGER NOT NULL,
+      collaboration INTEGER NOT NULL,
+      root_cause_accuracy INTEGER NOT NULL,
+      improvement_suggestions TEXT,
+      summary TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
 }
 
 function rowToObject(row, columns) {

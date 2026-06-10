@@ -23,6 +23,12 @@ let state = {
   detailNode: null,
   showAddNode: false,
   showCreateIncident: false,
+  templates: [],
+  selectedTemplateId: null,
+  showTemplateList: false,
+  currentReview: null,
+  showReviewForm: false,
+  reviewStats: null,
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -32,6 +38,8 @@ function render() {
   const app = document.getElementById('app');
   if (state.view === 'list') {
     app.innerHTML = renderIncidentList();
+  } else if (state.view === 'stats') {
+    app.innerHTML = renderStatsPage();
   } else {
     app.innerHTML = renderTimeline();
     renderTimelineGraphics();
@@ -58,17 +66,31 @@ function renderIncidentList() {
     <p style="color:var(--text2);margin-bottom:8px;">选择一个事故进入协作房间，或创建新事故</p>
     <div style="margin-bottom:16px;display:flex;gap:8px;">
       <button class="btn btn-primary" data-action="create-incident">+ 创建事故</button>
+      <button class="btn btn-outline" data-action="show-template-list">📋 模板管理</button>
+      <button class="btn btn-outline" data-action="go-stats">📊 评分统计</button>
     </div>
     <div class="incident-cards">${cards || '<div class="empty-state">暂无事故记录</div>'}</div>
     ${state.showCreateIncident ? renderCreateIncidentModal() : ''}
+    ${state.showTemplateList ? renderTemplateListModal() : ''}
   </div>`;
 }
 
 function renderCreateIncidentModal() {
+  const templateOptions = state.templates.map(t =>
+    `<option value="${t.id}">${t.name} (${t.node_count}个节点)</option>`
+  ).join('');
+
   return `
   <div class="modal-overlay" data-action="close-modal">
     <div class="modal" onclick="event.stopPropagation()">
       <h2>创建新事故</h2>
+      <div class="form-group">
+        <label>使用模板</label>
+        <select id="ci-template">
+          <option value="">不使用模板</option>
+          ${templateOptions}
+        </select>
+      </div>
       <div class="form-group">
         <label>事故标题</label>
         <input id="ci-title" placeholder="例如：支付服务大规模超时">
@@ -134,7 +156,9 @@ function renderTimeline() {
         ${!isClosed ? `
         <button class="btn btn-primary btn-sm" data-action="add-node">+ 添加事件</button>
         <button class="btn btn-outline btn-sm" data-action="toggle-connection" style="${state.connectionMode ? 'background:var(--primary);color:white' : ''}">🔗 因果链</button>
-        ` : ''}
+        ` : `
+        <button class="btn btn-outline btn-sm" data-action="save-as-template">📋 另存为模板</button>
+        `}
         <button class="btn btn-outline btn-sm ${state.showKeyPath ? 'active' : ''}" data-action="toggle-keypath" style="${state.showKeyPath ? 'background:var(--warning);color:#1a1a1a' : ''}">⚡ 关键路径</button>
         <button class="btn btn-outline btn-sm" data-action="export-md">导出 MD</button>
         ${!isClosed ? `<button class="btn btn-danger btn-sm" data-action="close-incident">关闭事故</button>` : ''}
@@ -207,6 +231,7 @@ function renderTimeline() {
       </div>
     </div>
 
+    ${isClosed ? renderReviewPanel() : ''}
     ${state.detailNode ? renderDetailCard() : ''}
     ${state.showAddNode ? renderAddNodeModal() : ''}
   </div>`;
@@ -439,9 +464,174 @@ function isLinkOnKeyPath(link) {
   return false;
 }
 
+function renderTemplateListModal() {
+  const items = state.templates.map(t => `
+    <div class="template-item">
+      <div class="template-info">
+        <div class="template-name">${t.name}</div>
+        <div class="template-meta">来源事故: ${t.source_incident_id.substring(0,8)}... | ${t.node_count}个节点 | ${t.created_at}</div>
+      </div>
+      <button class="btn btn-danger btn-sm" data-action="delete-template" data-id="${t.id}">删除</button>
+    </div>
+  `).join('');
+
+  return `
+  <div class="modal-overlay" data-action="close-modal">
+    <div class="modal" onclick="event.stopPropagation()" style="width:560px;">
+      <h2>事故模板管理</h2>
+      <div class="template-list">
+        ${items || '<div class="empty-state">暂无模板</div>'}
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-outline" data-action="close-modal">关闭</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderReviewPanel() {
+  const review = state.currentReview;
+  if (review) {
+    return `
+    <div class="review-panel">
+      <div class="review-panel-header">复盘评分</div>
+      <div class="review-scores">
+        <div class="review-score-item">
+          <label>响应速度</label>
+          <div class="score-stars">${renderStars(review.response_speed)}</div>
+        </div>
+        <div class="review-score-item">
+          <label>协作效率</label>
+          <div class="score-stars">${renderStars(review.collaboration)}</div>
+        </div>
+        <div class="review-score-item">
+          <label>根因定位准确度</label>
+          <div class="score-stars">${renderStars(review.root_cause_accuracy)}</div>
+        </div>
+      </div>
+      ${review.improvement_suggestions ? `<div class="review-text-field"><label>改进建议</label><p>${review.improvement_suggestions}</p></div>` : ''}
+      ${review.summary ? `<div class="review-text-field"><label>总结</label><p>${review.summary}</p></div>` : ''}
+      <div class="review-footer">评分已提交，不可修改</div>
+    </div>`;
+  }
+
+  if (state.showReviewForm) {
+    return `
+    <div class="review-panel">
+      <div class="review-panel-header">提交复盘评分</div>
+      <div class="form-group">
+        <label>响应速度 (1-5)</label>
+        <div class="score-input" id="rv-speed">
+          ${[1,2,3,4,5].map(n => `<span class="star-btn" data-score="${n}" data-dim="speed">★</span>`).join('')}
+        </div>
+      </div>
+      <div class="form-group">
+        <label>协作效率 (1-5)</label>
+        <div class="score-input" id="rv-collab">
+          ${[1,2,3,4,5].map(n => `<span class="star-btn" data-score="${n}" data-dim="collab">★</span>`).join('')}
+        </div>
+      </div>
+      <div class="form-group">
+        <label>根因定位准确度 (1-5)</label>
+        <div class="score-input" id="rv-root">
+          ${[1,2,3,4,5].map(n => `<span class="star-btn" data-score="${n}" data-dim="root">★</span>`).join('')}
+        </div>
+      </div>
+      <div class="form-group">
+        <label>改进建议</label>
+        <textarea id="rv-suggestions" placeholder="对后续改进的建议..."></textarea>
+      </div>
+      <div class="form-group">
+        <label>总结</label>
+        <textarea id="rv-summary" placeholder="事故复盘总结..."></textarea>
+      </div>
+      <div class="review-form-actions">
+        <button class="btn btn-outline" data-action="cancel-review">取消</button>
+        <button class="btn btn-primary" data-action="submit-review">提交评分</button>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="review-panel">
+    <div class="review-panel-header">复盘评分</div>
+    <div class="review-empty">
+      <p>该事故尚未提交复盘评分</p>
+      <button class="btn btn-primary btn-sm" data-action="show-review-form">填写评分</button>
+    </div>
+  </div>`;
+}
+
+function renderStars(score) {
+  return [1,2,3,4,5].map(n =>
+    `<span class="star ${n <= score ? 'star-filled' : ''}">★</span>`
+  ).join('');
+}
+
+function renderStatsPage() {
+  const stats = state.reviewStats;
+  if (!stats) return '<div class="stats-page"><h1>加载中...</h1></div>';
+
+  const overall = stats.overall;
+  const monthly = stats.monthly || [];
+
+  return `
+  <div class="stats-page">
+    <header>
+      <h1>
+        <span style="cursor:pointer" data-action="go-back-list">←</span>
+        复盘评分统计
+      </h1>
+    </header>
+    <div class="stats-content">
+      ${overall && overall.total_count > 0 ? `
+      <div class="stats-overview">
+        <div class="stat-card">
+          <div class="stat-value">${overall.avg_overall || '-'}</div>
+          <div class="stat-label">综合平均分</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">${overall.avg_response_speed || '-'}</div>
+          <div class="stat-label">响应速度</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">${overall.avg_collaboration || '-'}</div>
+          <div class="stat-label">协作效率</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">${overall.avg_root_cause_accuracy || '-'}</div>
+          <div class="stat-label">根因定位</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">${overall.total_count}</div>
+          <div class="stat-label">已评分事故数</div>
+        </div>
+      </div>
+      <div class="stats-chart-container">
+        <h2>各维度月度趋势</h2>
+        <canvas id="stats-chart" width="800" height="350"></canvas>
+      </div>
+      ` : '<div class="empty-state">暂无评分数据</div>'}
+    </div>
+  </div>`;
+}
+
 function bindEvents() {
   document.querySelectorAll('[data-action]').forEach(el => {
     el.onclick = handleAction;
+  });
+
+  document.querySelectorAll('.star-btn').forEach(el => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const score = parseInt(el.dataset.score);
+      const dim = el.dataset.dim;
+      const container = el.parentElement;
+      container.querySelectorAll('.star-btn').forEach(s => {
+        s.classList.toggle('star-btn-selected', parseInt(s.dataset.score) <= score);
+      });
+      container.dataset.value = score;
+    };
   });
 
   document.querySelectorAll('.tl-node').forEach(el => {
@@ -520,7 +710,7 @@ function handleAction(e) {
     case 'open-incident': openIncident(id); break;
     case 'go-back': leaveIncident(); break;
     case 'create-incident': state.showCreateIncident = true; render(); break;
-    case 'close-modal': state.showCreateIncident = false; state.showAddNode = false; render(); break;
+    case 'close-modal': state.showCreateIncident = false; state.showAddNode = false; state.showTemplateList = false; state.showReviewForm = false; render(); break;
     case 'submit-create-incident': submitCreateIncident(); break;
     case 'add-node': state.showAddNode = true; render(); break;
     case 'submit-add-node': submitAddNode(); break;
@@ -543,6 +733,14 @@ function handleAction(e) {
       state.detailNode = null;
       render();
       break;
+    case 'save-as-template': saveAsTemplate(); break;
+    case 'show-template-list': loadAndShowTemplates(); break;
+    case 'delete-template': deleteTemplate(id); break;
+    case 'go-stats': goStats(); break;
+    case 'go-back-list': leaveToStatsOrList(); break;
+    case 'show-review-form': state.showReviewForm = true; render(); break;
+    case 'cancel-review': state.showReviewForm = false; render(); break;
+    case 'submit-review': submitReview(); break;
   }
 }
 
@@ -578,10 +776,14 @@ async function openIncident(id) {
   const kpData = await kpRes.json();
   state.keyPath = kpData.path || [];
 
+  const reviewRes = await fetch(`${API}/incidents/${id}/reviews`);
+  state.currentReview = await reviewRes.json();
+
   state.view = 'timeline';
   state.detailNode = null;
   state.selectedNodeId = null;
   state.connectionMode = false;
+  state.showReviewForm = false;
 
   connectWS(id);
   render();
@@ -605,18 +807,25 @@ async function submitCreateIncident() {
   const startTime = document.getElementById('ci-start').value;
   const endTime = document.getElementById('ci-end').value;
   const ownerName = document.getElementById('ci-owner').value;
+  const templateId = document.getElementById('ci-template')?.value;
   if (!title || !startTime) { showToast('请填写标题和起始时间'); return; }
   state.userName = ownerName || state.userName;
   localStorage.setItem('tl_username', state.userName);
 
-  const res = await fetch(`${API}/incidents`, {
+  const body = { title, severity, startTime: new Date(startTime).toISOString(), endTime: endTime ? new Date(endTime).toISOString() : null, ownerName };
+  const url = templateId ? `${API}/incidents/from-template/${templateId}` : `${API}/incidents`;
+
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title, severity, startTime: new Date(startTime).toISOString(), endTime: endTime ? new Date(endTime).toISOString() : null, ownerName })
+    body: JSON.stringify(body)
   });
   if (res.ok) {
     state.showCreateIncident = false;
     loadIncidents();
+  } else {
+    const err = await res.json();
+    showToast(err.error || '创建失败');
   }
 }
 
@@ -880,7 +1089,175 @@ function handleWSMessage(msg) {
 async function loadIncidents() {
   const res = await fetch(`${API}/incidents`);
   state.incidents = await res.json();
+  const tmplRes = await fetch(`${API}/templates`);
+  state.templates = await tmplRes.json();
   render();
+}
+
+async function saveAsTemplate() {
+  const inc = state.currentIncident;
+  if (!inc || inc.status !== 'closed') return;
+  const name = prompt('请输入模板名称:', inc.title + ' (模板)');
+  if (!name) return;
+  const res = await fetch(`${API}/templates/from-incident/${inc.id}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  if (res.ok) {
+    showToast('模板已保存');
+    const tmplRes = await fetch(`${API}/templates`);
+    state.templates = await tmplRes.json();
+  } else {
+    const err = await res.json();
+    showToast(err.error || '保存失败');
+  }
+}
+
+async function loadAndShowTemplates() {
+  const res = await fetch(`${API}/templates`);
+  state.templates = await res.json();
+  state.showTemplateList = true;
+  render();
+}
+
+async function deleteTemplate(id) {
+  if (!confirm('确认删除此模板?')) return;
+  await fetch(`${API}/templates/${id}`, { method: 'DELETE' });
+  const res = await fetch(`${API}/templates`);
+  state.templates = await res.json();
+  render();
+}
+
+async function goStats() {
+  state.view = 'stats';
+  const res = await fetch(`${API}/reviews/stats`);
+  state.reviewStats = await res.json();
+  render();
+  renderStatsChart();
+}
+
+function leaveToStatsOrList() {
+  state.view = 'list';
+  state.reviewStats = null;
+  loadIncidents();
+}
+
+async function submitReview() {
+  const inc = state.currentIncident;
+  const speedVal = parseInt(document.getElementById('rv-speed')?.dataset.value || '0');
+  const collabVal = parseInt(document.getElementById('rv-collab')?.dataset.value || '0');
+  const rootVal = parseInt(document.getElementById('rv-root')?.dataset.value || '0');
+  if (!speedVal || !collabVal || !rootVal) { showToast('请为所有维度打分'); return; }
+  const suggestions = document.getElementById('rv-suggestions')?.value || '';
+  const summary = document.getElementById('rv-summary')?.value || '';
+
+  const res = await fetch(`${API}/incidents/${inc.id}/reviews`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      responseSpeed: speedVal,
+      collaboration: collabVal,
+      rootCauseAccuracy: rootVal,
+      improvementSuggestions: suggestions,
+      summary,
+      userName: state.userName
+    })
+  });
+  if (res.ok) {
+    state.currentReview = await res.json();
+    state.showReviewForm = false;
+    showToast('评分已提交');
+    render();
+  } else {
+    const err = await res.json();
+    showToast(err.error || '提交失败');
+  }
+}
+
+function renderStatsChart() {
+  const canvas = document.getElementById('stats-chart');
+  if (!canvas) return;
+  const stats = state.reviewStats;
+  if (!stats || !stats.monthly || stats.monthly.length === 0) return;
+
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = 800 * dpr;
+  canvas.height = 350 * dpr;
+  canvas.style.width = '800px';
+  canvas.style.height = '350px';
+  ctx.scale(dpr, dpr);
+
+  const monthly = stats.monthly;
+  const labels = monthly.map(m => m.month);
+  const datasets = [
+    { key: 'avg_response_speed', label: '响应速度', color: '#3b82f6' },
+    { key: 'avg_collaboration', label: '协作效率', color: '#a855f7' },
+    { key: 'avg_root_cause_accuracy', label: '根因定位', color: '#f59e0b' },
+    { key: 'avg_overall', label: '综合', color: '#22c55e' }
+  ];
+
+  const W = 800, H = 350;
+  const PAD_L = 50, PAD_R = 100, PAD_T = 30, PAD_B = 50;
+  const chartW = W - PAD_L - PAD_R;
+  const chartH = H - PAD_T - PAD_B;
+
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 5; i++) {
+    const y = PAD_T + chartH - (i / 5) * chartH;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y);
+    ctx.lineTo(PAD_L + chartW, y);
+    ctx.stroke();
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(i.toString(), PAD_L - 8, y + 4);
+  }
+
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  labels.forEach((l, i) => {
+    const x = PAD_L + (i / Math.max(labels.length - 1, 1)) * chartW;
+    ctx.fillText(l, x, H - 12);
+  });
+
+  datasets.forEach(ds => {
+    ctx.strokeStyle = ds.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    monthly.forEach((m, i) => {
+      const x = PAD_L + (i / Math.max(monthly.length - 1, 1)) * chartW;
+      const y = PAD_T + chartH - ((m[ds.key] || 0) / 5) * chartH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    monthly.forEach((m, i) => {
+      const x = PAD_L + (i / Math.max(monthly.length - 1, 1)) * chartW;
+      const y = PAD_T + chartH - ((m[ds.key] || 0) / 5) * chartH;
+      ctx.fillStyle = ds.color;
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+
+  datasets.forEach((ds, i) => {
+    const y = PAD_T + 20 + i * 20;
+    ctx.fillStyle = ds.color;
+    ctx.fillRect(PAD_L + chartW + 15, y, 12, 12);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(ds.label, PAD_L + chartW + 32, y + 10);
+  });
 }
 
 function stringToColor(s) {
@@ -902,6 +1279,7 @@ function formatLogAction(l) {
     delete_causal_link: '删除了因果链',
     join: '加入了协作房间',
     close_incident: '关闭了事故',
+    submit_review: '提交了复盘评分',
   };
   return map[l.action] || l.action;
 }

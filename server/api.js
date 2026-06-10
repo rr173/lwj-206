@@ -439,6 +439,127 @@ function createApiRouter(wss) {
     res.send(md);
   });
 
+  router.post('/incidents/:id/reviews', (req, res) => {
+    const db = req.db;
+    const crypto = require('crypto');
+    const incidentId = req.params.id;
+    const inc = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [incidentId])[0];
+    if (!inc) return res.status(404).json({ error: 'incident not found' });
+    if (inc.status !== 'closed') return res.status(400).json({ error: 'only closed incidents can be reviewed' });
+    const existing = runQuery(db, 'SELECT id FROM incident_reviews WHERE incident_id = ?', [incidentId]);
+    if (existing.length > 0) return res.status(400).json({ error: 'review already exists' });
+    const { responseSpeed, collaboration, rootCauseAccuracy, improvementSuggestions, summary } = req.body;
+    if (!responseSpeed || !collaboration || !rootCauseAccuracy) {
+      return res.status(400).json({ error: 'responseSpeed, collaboration, rootCauseAccuracy required' });
+    }
+    for (const s of [responseSpeed, collaboration, rootCauseAccuracy]) {
+      if (s < 1 || s > 5 || !Number.isInteger(s)) return res.status(400).json({ error: 'scores must be integers 1-5' });
+    }
+    const id = crypto.randomUUID();
+    runExec(db, `INSERT INTO incident_reviews (id, incident_id, response_speed, collaboration, root_cause_accuracy, improvement_suggestions, summary) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, incidentId, responseSpeed, collaboration, rootCauseAccuracy, improvementSuggestions || null, summary || null]);
+    const review = runQuery(db, 'SELECT * FROM incident_reviews WHERE id = ?', [id])[0];
+    addLog(db, incidentId, req.body.userName || 'system', 'submit_review', 'review', id, null);
+    res.status(201).json(review);
+  });
+
+  router.get('/incidents/:id/reviews', (req, res) => {
+    const reviews = runQuery(req.db, 'SELECT * FROM incident_reviews WHERE incident_id = ?', [req.params.id]);
+    res.json(reviews.length > 0 ? reviews[0] : null);
+  });
+
+  router.get('/reviews/stats', (req, res) => {
+    const db = req.db;
+    const rows = runQuery(db, `
+      SELECT
+        strftime('%Y-%m', r.created_at) as month,
+        COUNT(*) as count,
+        ROUND(AVG(r.response_speed), 2) as avg_response_speed,
+        ROUND(AVG(r.collaboration), 2) as avg_collaboration,
+        ROUND(AVG(r.root_cause_accuracy), 2) as avg_root_cause_accuracy,
+        ROUND(AVG((r.response_speed + r.collaboration + r.root_cause_accuracy) / 3.0), 2) as avg_overall
+      FROM incident_reviews r
+      GROUP BY strftime('%Y-%m', r.created_at)
+      ORDER BY month ASC
+    `);
+    const totalRows = runQuery(db, `
+      SELECT
+        COUNT(*) as total_count,
+        ROUND(AVG(response_speed), 2) as avg_response_speed,
+        ROUND(AVG(collaboration), 2) as avg_collaboration,
+        ROUND(AVG(root_cause_accuracy), 2) as avg_root_cause_accuracy,
+        ROUND(AVG((response_speed + collaboration + root_cause_accuracy) / 3.0), 2) as avg_overall
+      FROM incident_reviews
+    `);
+    res.json({ overall: totalRows[0] || null, monthly: rows });
+  });
+
+  router.post('/templates/from-incident/:incidentId', (req, res) => {
+    const db = req.db;
+    const crypto = require('crypto');
+    const incidentId = req.params.incidentId;
+    const inc = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [incidentId])[0];
+    if (!inc) return res.status(404).json({ error: 'incident not found' });
+    if (inc.status !== 'closed') return res.status(400).json({ error: 'only closed incidents can be saved as template' });
+    const { name } = req.body;
+    const templateName = name || inc.title + ' (模板)';
+    const templateId = crypto.randomUUID();
+    runExec(db, 'INSERT INTO incident_templates (id, name, source_incident_id) VALUES (?, ?, ?)',
+      [templateId, templateName, incidentId]);
+    const nodes = runQuery(db, 'SELECT * FROM timeline_nodes WHERE incident_id = ? ORDER BY occurred_at ASC, sequence ASC', [incidentId]);
+    const startMs = new Date(inc.start_time).getTime();
+    nodes.forEach((n, i) => {
+      const offsetSec = Math.round((new Date(n.occurred_at).getTime() - startMs) / 1000);
+      const descTemplate = n.description.replace(/\d+(\.\d+)?/g, '{{数值}}');
+      runExec(db, `INSERT INTO template_nodes (id, template_id, offset_seconds, source_type, service_name, description_template, sequence) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [crypto.randomUUID(), templateId, offsetSec, n.source_type, n.service_name, descTemplate, i]);
+    });
+    const tmpl = runQuery(db, 'SELECT * FROM incident_templates WHERE id = ?', [templateId])[0];
+    const tmplNodes = runQuery(db, 'SELECT * FROM template_nodes WHERE template_id = ? ORDER BY sequence ASC', [templateId]);
+    res.status(201).json({ template: tmpl, nodes: tmplNodes });
+  });
+
+  router.get('/templates', (req, res) => {
+    const templates = runQuery(req.db, 'SELECT t.*, (SELECT COUNT(*) FROM template_nodes WHERE template_id = t.id) as node_count FROM incident_templates t ORDER BY created_at DESC');
+    res.json(templates);
+  });
+
+  router.delete('/templates/:id', (req, res) => {
+    const db = req.db;
+    runExec(db, 'DELETE FROM template_nodes WHERE template_id = ?', [req.params.id]);
+    runExec(db, 'DELETE FROM incident_templates WHERE id = ?', [req.params.id]);
+    res.json({ ok: true });
+  });
+
+  router.post('/incidents/from-template/:templateId', (req, res) => {
+    const db = req.db;
+    const crypto = require('crypto');
+    const templateId = req.params.templateId;
+    const tmpl = runQuery(db, 'SELECT * FROM incident_templates WHERE id = ?', [templateId])[0];
+    if (!tmpl) return res.status(404).json({ error: 'template not found' });
+    const { title, severity, startTime, endTime, ownerName } = req.body;
+    if (!title || !severity || !startTime) return res.status(400).json({ error: 'title, severity, startTime required' });
+    if (!['P0','P1','P2','P3'].includes(severity)) return res.status(400).json({ error: 'severity must be P0-P3' });
+    const id = crypto.randomUUID();
+    const roomCode = 'RM-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+    runExec(db, `INSERT INTO incidents (id, title, severity, start_time, end_time, owner_id, room_code) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, title, severity, startTime, endTime || null, ownerName || null, roomCode]);
+    if (ownerName) {
+      runExec(db, `INSERT INTO participants (id, incident_id, user_name, role) VALUES (?, ?, ?, 'owner')`,
+        [crypto.randomUUID(), id, ownerName]);
+    }
+    const tmplNodes = runQuery(db, 'SELECT * FROM template_nodes WHERE template_id = ? ORDER BY sequence ASC', [templateId]);
+    const startMs = new Date(startTime).getTime();
+    tmplNodes.forEach(tn => {
+      const nodeTime = new Date(startMs + tn.offset_seconds * 1000);
+      const normTime = normalizeTime(nodeTime.toISOString());
+      runExec(db, `INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [crypto.randomUUID(), id, normTime, tn.description_template, tn.source_type, tn.service_name, ownerName || 'template', tn.sequence]);
+    });
+    const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
+    res.status(201).json(incident);
+  });
+
   return router;
 }
 
