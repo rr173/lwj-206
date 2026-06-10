@@ -27,6 +27,10 @@ async function getDb() {
     seedDemoIfEmpty();
     saveDb();
     setInterval(saveDb, 5000);
+
+    process.on('SIGINT', () => { saveDb(); process.exit(0); });
+    process.on('SIGTERM', () => { saveDb(); process.exit(0); });
+    process.on('exit', () => { saveDb(); });
   }
   return { db, uuidv4 };
 }
@@ -217,4 +221,4 @@ function seedDemoIfEmpty() {
     [uuidv4(), incidentId, nodeIds[0], nodeIds[4], 'alice']);
 }
 
-module.exports = { getDb, saveDb };
+module.exports = { getDb, saveDb, runQuery, runExec };

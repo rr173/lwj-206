@@ -84,11 +84,11 @@ function renderCreateIncidentModal() {
       </div>
       <div class="form-group">
         <label>起始时间</label>
-        <input id="ci-start" type="datetime-local">
+        <input id="ci-start" type="datetime-local" step="1">
       </div>
       <div class="form-group">
         <label>结束时间(可选)</label>
-        <input id="ci-end" type="datetime-local">
+        <input id="ci-end" type="datetime-local" step="1">
       </div>
       <div class="form-group">
         <label>你的姓名</label>
@@ -253,7 +253,7 @@ function renderAddNodeModal() {
       <h2>添加事件节点</h2>
       <div class="form-group">
         <label>发生时间</label>
-        <input id="an-time" type="datetime-local" value="${inc.start_time.slice(0, 16)}">
+        <input id="an-time" type="datetime-local" step="1" value="${inc.start_time.slice(0, 19)}">
       </div>
       <div class="form-group">
         <label>事件描述</label>
@@ -632,7 +632,7 @@ async function submitAddNode() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      occurredAt: new Date(time).toISOString(),
+      occurredAt: time,
       description: desc,
       sourceType: src,
       serviceName: svc,

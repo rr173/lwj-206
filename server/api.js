@@ -1,26 +1,12 @@
 const express = require('express');
-const { getDb } = require('./db');
+const { getDb, runQuery, runExec } = require('./db');
 
-function runQuery(db, sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const rows = [];
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return rows;
-}
-
-function runExec(db, sql, params = []) {
-  if (params.length === 0) {
-    db.run(sql);
-  } else {
-    const stmt = db.prepare(sql);
-    stmt.bind(params);
-    stmt.step();
-    stmt.free();
-  }
+function normalizeTime(t) {
+  if (!t) return t;
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return t;
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function createApiRouter(wss) {
@@ -200,10 +186,11 @@ function createApiRouter(wss) {
     const id = crypto.randomUUID();
     const seqRes = runQuery(db, 'SELECT COALESCE(MAX(sequence),0)+1 as s FROM timeline_nodes WHERE incident_id = ?', [req.params.incidentId]);
     const seq = seqRes[0].s;
+    const normOccurredAt = normalizeTime(occurredAt);
     runExec(db, `
       INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [id, req.params.incidentId, occurredAt, description, sourceType, serviceName, createdBy, seq]);
+    `, [id, req.params.incidentId, normOccurredAt, description, sourceType, serviceName, createdBy, seq]);
     checkDuplicates(db, req.params.incidentId, id);
     const node = runQuery(db, 'SELECT * FROM timeline_nodes WHERE id = ?', [id])[0];
     addLog(db, req.params.incidentId, createdBy, 'add_node', 'node', id, description);
@@ -225,7 +212,8 @@ function createApiRouter(wss) {
       }
     }
     const { occurredAt, description, sourceType, serviceName } = req.body;
-    const newTime = occurredAt || existing.occurred_at;
+    const normOccurredAt = occurredAt ? normalizeTime(occurredAt) : null;
+    const newTime = normOccurredAt || existing.occurred_at;
     const newDesc = description || existing.description;
     const newSrc = sourceType || existing.source_type;
     const newSvc = serviceName || existing.service_name;
@@ -233,7 +221,7 @@ function createApiRouter(wss) {
       UPDATE timeline_nodes SET occurred_at = ?, description = ?, source_type = ?, service_name = ?, updated_at = datetime('now')
       WHERE id = ?
     `, [newTime, newDesc, newSrc, newSvc, req.params.nodeId]);
-    if (occurredAt && occurredAt !== existing.occurred_at) {
+    if (normOccurredAt && normOccurredAt !== existing.occurred_at) {
       checkDuplicates(db, req.params.incidentId, req.params.nodeId);
     }
     const node = runQuery(db, 'SELECT * FROM timeline_nodes WHERE id = ?', [req.params.nodeId])[0];
