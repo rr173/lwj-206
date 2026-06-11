@@ -215,6 +215,11 @@ function triggerAsyncMatching(db, wss, incidentId) {
     if (!inc) return res.status(404).json({ error: 'not found' });
     runExec(db, "UPDATE incidents SET status = 'open', updated_at = datetime('now') WHERE id = ?", [req.params.id]);
     runExec(db, 'DELETE FROM incident_signatures WHERE incident_id = ?', [req.params.id]);
+    try {
+      serviceHealthEngine.unprocessIncidentServices(db, req.params.id);
+    } catch (e) {
+      console.error('service health unprocess error on reopen:', e);
+    }
     addLog(db, req.params.id, req.body.userName || 'system', 'reopen_incident', 'incident', req.params.id, null);
     broadcast(req.params.id, { type: 'incident_reopened', incidentId: req.params.id });
     pushSync(db, req.params.id, 'incident_reopened', { incidentId: req.params.id });

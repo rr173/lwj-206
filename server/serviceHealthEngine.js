@@ -122,6 +122,22 @@ function updateServiceHealth(db, serviceName) {
   return { service_name: serviceName, health_score: healthScore, ...stats };
 }
 
+function isIncidentAlreadyProcessed(db, incidentId) {
+  const existing = runQuery(db, `
+    SELECT COUNT(*) as c FROM service_incident_links WHERE incident_id = ?
+  `, [incidentId])[0];
+  return existing && existing.c > 0;
+}
+
+function getIncidentServiceNames(db, incidentId) {
+  const nodes = runQuery(db, `
+    SELECT DISTINCT service_name
+    FROM timeline_nodes
+    WHERE incident_id = ? AND is_excluded = 0
+  `, [incidentId]);
+  return nodes.map(n => n.service_name);
+}
+
 function processIncidentServices(db, incidentId) {
   const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [incidentId])[0];
   if (!incident) return [];
@@ -136,6 +152,8 @@ function processIncidentServices(db, incidentId) {
   if (nodes.length === 0) return [];
 
   const closedAt = incident.status === 'closed' ? (incident.end_time || incident.updated_at) : null;
+
+  const alreadyProcessed = isIncidentAlreadyProcessed(db, incidentId);
 
   const serviceNames = [];
   for (const node of nodes) {
@@ -156,18 +174,20 @@ function processIncidentServices(db, incidentId) {
     serviceNames.push(node.service_name);
   }
 
-  for (let i = 0; i < serviceNames.length; i++) {
-    for (let j = i + 1; j < serviceNames.length; j++) {
-      const a = serviceNames[i];
-      const b = serviceNames[j];
-      const [s1, s2] = a < b ? [a, b] : [b, a];
-      runExec(db, `
-        INSERT INTO service_cooccurrences (service_a, service_b, cooccurrence_count, last_cooccurrence)
-        VALUES (?, ?, 1, datetime('now'))
-        ON CONFLICT(service_a, service_b) DO UPDATE SET
-          cooccurrence_count = cooccurrence_count + 1,
-          last_cooccurrence = datetime('now')
-      `, [s1, s2]);
+  if (!alreadyProcessed) {
+    for (let i = 0; i < serviceNames.length; i++) {
+      for (let j = i + 1; j < serviceNames.length; j++) {
+        const a = serviceNames[i];
+        const b = serviceNames[j];
+        const [s1, s2] = a < b ? [a, b] : [b, a];
+        runExec(db, `
+          INSERT INTO service_cooccurrences (service_a, service_b, cooccurrence_count, last_cooccurrence)
+          VALUES (?, ?, 1, datetime('now'))
+          ON CONFLICT(service_a, service_b) DO UPDATE SET
+            cooccurrence_count = cooccurrence_count + 1,
+            last_cooccurrence = datetime('now')
+        `, [s1, s2]);
+      }
     }
   }
 
@@ -179,13 +199,74 @@ function processIncidentServices(db, incidentId) {
   return results;
 }
 
+function unprocessIncidentServices(db, incidentId) {
+  const serviceNames = getIncidentServiceNames(db, incidentId);
+  if (serviceNames.length === 0) return [];
+
+  for (let i = 0; i < serviceNames.length; i++) {
+    for (let j = i + 1; j < serviceNames.length; j++) {
+      const a = serviceNames[i];
+      const b = serviceNames[j];
+      const [s1, s2] = a < b ? [a, b] : [b, a];
+      const existing = runQuery(db, `
+        SELECT cooccurrence_count FROM service_cooccurrences WHERE service_a = ? AND service_b = ?
+      `, [s1, s2])[0];
+      if (existing) {
+        const newCount = existing.cooccurrence_count - 1;
+        if (newCount <= 0) {
+          runExec(db, `DELETE FROM service_cooccurrences WHERE service_a = ? AND service_b = ?`, [s1, s2]);
+        } else {
+          runExec(db, `
+            UPDATE service_cooccurrences SET cooccurrence_count = ?, last_cooccurrence = datetime('now')
+            WHERE service_a = ? AND service_b = ?
+          `, [newCount, s1, s2]);
+        }
+      }
+    }
+  }
+
+  runExec(db, 'DELETE FROM service_incident_links WHERE incident_id = ?', [incidentId]);
+
+  const results = [];
+  for (const svc of serviceNames) {
+    results.push(updateServiceHealth(db, svc));
+  }
+
+  return results;
+}
+
 function recalculateAllServices(db) {
+  runExec(db, 'DELETE FROM service_cooccurrences');
+  runExec(db, 'DELETE FROM service_incident_links');
+  runExec(db, 'DELETE FROM service_health');
+
+  const closedIncidents = runQuery(db, `
+    SELECT id FROM incidents WHERE status = 'closed'
+  `);
+
+  for (const inc of closedIncidents) {
+    processIncidentServices(db, inc.id);
+  }
+
   const services = runQuery(db, 'SELECT DISTINCT service_name FROM service_incident_links');
   const results = [];
   for (const s of services) {
     results.push(updateServiceHealth(db, s.service_name));
   }
   return results;
+}
+
+function initializeServiceHealth(db) {
+  const existingCount = runQuery(db, 'SELECT COUNT(*) as c FROM service_health')[0].c;
+  if (existingCount > 0) return;
+
+  const closedIncidents = runQuery(db, `
+    SELECT id FROM incidents WHERE status = 'closed'
+  `);
+
+  for (const inc of closedIncidents) {
+    processIncidentServices(db, inc.id);
+  }
 }
 
 function getTopServices(db, limit = 50) {
@@ -224,6 +305,7 @@ function getServiceMonthlyTrend(db, serviceName, months = 6) {
     FROM service_incident_links sil
     JOIN incidents i ON sil.incident_id = i.id
     WHERE sil.service_name = ?
+      AND i.status = 'closed'
       AND i.start_time >= date('now', '-${months} months')
     GROUP BY strftime('%Y-%m', i.start_time)
     ORDER BY month ASC
@@ -263,7 +345,9 @@ module.exports = {
   getServiceStats,
   updateServiceHealth,
   processIncidentServices,
+  unprocessIncidentServices,
   recalculateAllServices,
+  initializeServiceHealth,
   getTopServices,
   getServiceCooccurrences,
   getServiceIncidents,

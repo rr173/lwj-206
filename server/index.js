@@ -4,6 +4,7 @@ const path = require('path');
 const setupWebSocket = require('./ws');
 const createApiRouter = require('./api');
 const { getDb } = require('./db');
+const serviceHealthEngine = require('./serviceHealthEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -19,7 +20,13 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-getDb();
+getDb().then(({ db }) => {
+  try {
+    serviceHealthEngine.initializeServiceHealth(db);
+  } catch (e) {
+    console.error('initialize service health error:', e);
+  }
+});
 
 server.listen(PORT, () => {
   console.log(`Incident Timeline server running on http://localhost:${PORT}`);

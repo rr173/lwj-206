@@ -292,7 +292,7 @@ function seedDemoIfEmpty() {
   runExec(db, `
     INSERT INTO incidents (id, title, severity, start_time, end_time, status, owner_id, room_code)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `, [incidentId, '支付服务大规模超时事故', 'P1', baseTime, '2026-06-10T14:45:00', 'open', 'alice', roomCode]);
+  `, [incidentId, '支付服务大规模超时事故', 'P1', baseTime, '2026-06-10T14:45:00', 'closed', 'alice', roomCode]);
 
   const participants = [
     { name: 'alice', role: 'owner' },
@@ -339,6 +339,27 @@ function seedDemoIfEmpty() {
     [uuidv4(), incidentId, nodeIds[4], nodeIds[9], 'bob']);
   runExec(db, `INSERT INTO causal_links (id, incident_id, from_node_id, to_node_id, created_by) VALUES (?, ?, ?, ?, ?)`,
     [uuidv4(), incidentId, nodeIds[0], nodeIds[4], 'alice']);
+
+  const incident2Id = uuidv4();
+  const roomCode2 = 'DEMO-P2-2026';
+  runExec(db, `
+    INSERT INTO incidents (id, title, severity, start_time, end_time, status, owner_id, room_code)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [incident2Id, '数据库主从同步延迟导致读取旧数据', 'P2', '2026-06-11T09:00:00', '2026-06-11T09:30:00', 'closed', 'carol', roomCode2]);
+
+  const nodes2 = [
+    { id: uuidv4(), time: '2026-06-11T09:00:00', desc: '订单列表出现重复数据', src: 'monitor', svc: 'order-service', by: 'alice' },
+    { id: uuidv4(), time: '2026-06-11T09:02:00', desc: '从库同步延迟超过30秒', src: 'monitor', svc: 'order-db', by: 'carol' },
+    { id: uuidv4(), time: '2026-06-11T09:05:00', desc: '切换读流量到主库', src: 'manual', svc: 'order-db', by: 'carol' },
+    { id: uuidv4(), time: '2026-06-11T09:15:00', desc: '数据一致性恢复正常', src: 'monitor', svc: 'order-service', by: 'bob' },
+    { id: uuidv4(), time: '2026-06-11T09:30:00', desc: '问题确认解决', src: 'manual', svc: 'order-db', by: 'carol' }
+  ];
+  nodes2.forEach((n, i) => {
+    runExec(db, `
+      INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [n.id, incident2Id, n.time, n.desc, n.src, n.svc, n.by, i]);
+  });
 }
 
 module.exports = { getDb, saveDb, runQuery, runExec };
