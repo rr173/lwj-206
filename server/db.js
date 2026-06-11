@@ -189,6 +189,45 @@ function initSchema() {
       UNIQUE(incident_id, recommended_incident_id, marked_by)
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS service_health (
+      service_name TEXT PRIMARY KEY,
+      health_score INTEGER NOT NULL DEFAULT 100,
+      total_incidents INTEGER NOT NULL DEFAULT 0,
+      p0_count INTEGER NOT NULL DEFAULT 0,
+      p1_count INTEGER NOT NULL DEFAULT 0,
+      p2_count INTEGER NOT NULL DEFAULT 0,
+      p3_count INTEGER NOT NULL DEFAULT 0,
+      avg_mtbf_days REAL,
+      avg_recovery_minutes REAL,
+      last_incident_time TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS service_incident_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      service_name TEXT NOT NULL,
+      incident_id TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      incident_closed_at TEXT,
+      recovery_minutes REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(service_name, incident_id)
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS service_cooccurrences (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      service_a TEXT NOT NULL,
+      service_b TEXT NOT NULL,
+      cooccurrence_count INTEGER NOT NULL DEFAULT 1,
+      last_cooccurrence TEXT DEFAULT (datetime('now')),
+      UNIQUE(service_a, service_b)
+    );
+  `);
 }
 
 function rowToObject(row, columns) {

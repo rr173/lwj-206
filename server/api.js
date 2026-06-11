@@ -1,6 +1,7 @@
 const express = require('express');
 const { getDb, runQuery, runExec } = require('./db');
 const signatureEngine = require('./signatureEngine');
+const serviceHealthEngine = require('./serviceHealthEngine');
 
 const pendingMatching = new Set();
 
@@ -196,6 +197,11 @@ function triggerAsyncMatching(db, wss, incidentId) {
       signatureEngine.generateIncidentSignature(db, req.params.id);
     } catch (e) {
       console.error('signature generation error on close:', e);
+    }
+    try {
+      serviceHealthEngine.processIncidentServices(db, req.params.id);
+    } catch (e) {
+      console.error('service health calculation error on close:', e);
     }
     addLog(db, req.params.id, req.body.userName || 'system', 'close_incident', 'incident', req.params.id, null);
     broadcast(req.params.id, { type: 'incident_closed', incidentId: req.params.id });
@@ -737,6 +743,71 @@ function triggerAsyncMatching(db, wss, incidentId) {
       }
     });
     res.json({ ok: true });
+  });
+
+  router.get('/services/network', (req, res) => {
+    const db = req.db;
+    try {
+      const data = serviceHealthEngine.getAllServiceNetworkData(db);
+      res.json(data);
+    } catch (e) {
+      console.error('get service network error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/services/:name', (req, res) => {
+    const db = req.db;
+    const serviceName = req.params.name;
+    try {
+      const health = runQuery(db, 'SELECT * FROM service_health WHERE service_name = ?', [serviceName])[0];
+      if (!health) {
+        return res.status(404).json({ error: 'service not found' });
+      }
+      const incidents = serviceHealthEngine.getServiceIncidents(db, serviceName, 10);
+      const trend = serviceHealthEngine.getServiceMonthlyTrend(db, serviceName, 6);
+      res.json({ health, incidents, trend });
+    } catch (e) {
+      console.error('get service detail error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/services/:name/incidents', (req, res) => {
+    const db = req.db;
+    const serviceName = req.params.name;
+    const limit = parseInt(req.query.limit) || 10;
+    try {
+      const incidents = serviceHealthEngine.getServiceIncidents(db, serviceName, limit);
+      res.json(incidents);
+    } catch (e) {
+      console.error('get service incidents error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/services/:name/trend', (req, res) => {
+    const db = req.db;
+    const serviceName = req.params.name;
+    const months = parseInt(req.query.months) || 6;
+    try {
+      const trend = serviceHealthEngine.getServiceMonthlyTrend(db, serviceName, months);
+      res.json(trend);
+    } catch (e) {
+      console.error('get service trend error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.post('/services/recalculate', (req, res) => {
+    const db = req.db;
+    try {
+      const results = serviceHealthEngine.recalculateAllServices(db);
+      res.json({ recalculated: results.length, results });
+    } catch (e) {
+      console.error('recalculate services error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
   });
 
   return router;

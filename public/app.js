@@ -41,7 +41,12 @@ let state = {
   similarPanelFlash: false,
   expandedSimilarId: null,
   similarSummaries: {},
-  loadingSummaryId: null
+  loadingSummaryId: null,
+  serviceNetwork: { nodes: [], edges: [] },
+  selectedService: null,
+  selectedServiceDetail: null,
+  highlightServiceName: null,
+  serviceGraphAnimId: null
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -53,6 +58,14 @@ function render() {
     app.innerHTML = renderIncidentList();
   } else if (state.view === 'stats') {
     app.innerHTML = renderStatsPage();
+  } else if (state.view === 'services') {
+    app.innerHTML = renderServicesPage();
+    setTimeout(() => {
+      renderServiceGraph();
+      if (state.selectedServiceDetail) {
+        renderServiceTrendChart();
+      }
+    }, 0);
   } else {
     app.innerHTML = renderTimeline();
     renderTimelineGraphics();
@@ -81,6 +94,7 @@ function renderIncidentList() {
       <button class="btn btn-primary" data-action="create-incident">+ 创建事故</button>
       <button class="btn btn-outline" data-action="show-template-list">📋 模板管理</button>
       <button class="btn btn-outline" data-action="go-stats">📊 评分统计</button>
+      <button class="btn btn-outline" data-action="go-services">🌐 服务健康度</button>
     </div>
     <div class="incident-cards">${cards || '<div class="empty-state">暂无事故记录</div>'}</div>
     ${state.showCreateIncident ? renderCreateIncidentModal() : ''}
@@ -204,7 +218,7 @@ function renderTimeline() {
                 <div class="swim-lane" data-service="${svc}">
                   <div class="lane-label">
                     <div class="dot" style="background:${serviceColors[svc]}"></div>
-                    ${svc}
+                    <span class="service-link" data-action="go-services-detail" data-service="${escapeHtml(svc)}" title="点击查看服务健康度" onclick="event.stopPropagation(); goServicesDetail('${escapeHtml(svc).replace(/'/g, "\\'")}')">${escapeHtml(svc)}</span>
                   </div>
                   <div class="lane-content" data-service="${svc}"></div>
                 </div>
@@ -381,7 +395,7 @@ function renderDetailCard() {
       <button class="close-btn" data-action="close-detail">&times;</button>
     </div>
     <div class="card-field"><label>时间:</label>${n.occurred_at}</div>
-    <div class="card-field"><label>服务:</label>${n.service_name}</div>
+    <div class="card-field"><label>服务:</label><span class="service-link" data-action="go-services-detail" data-service="${escapeHtml(n.service_name)}" onclick="event.stopPropagation(); goServicesDetail('${escapeHtml(n.service_name).replace(/'/g, "\\'")}')">${escapeHtml(n.service_name)}</span></div>
     <div class="card-field"><label>来源:</label><span class="src-badge src-${n.source_type}">${SRC_LABELS[n.source_type]}</span></div>
     <div class="card-field"><label>创建者:</label>${n.created_by}</div>
     <div class="card-field"><label>状态:</label>
@@ -866,6 +880,8 @@ function handleAction(e) {
     case 'show-template-list': loadAndShowTemplates(); break;
     case 'delete-template': deleteTemplate(id); break;
     case 'go-stats': goStats(); break;
+    case 'go-services': goServices(); break;
+    case 'go-services-detail': goServicesDetail(e.currentTarget.dataset.service); break;
     case 'go-back-list': leaveToStatsOrList(); break;
     case 'show-review-form': state.showReviewForm = true; render(); break;
     case 'cancel-review': state.showReviewForm = false; render(); break;
@@ -880,6 +896,15 @@ function handleAction(e) {
       break;
     case 'mark-similar':
       markSimilarRecommendation(id, e.currentTarget.dataset.type);
+      break;
+    case 'refresh-service-graph':
+      loadServiceNetwork();
+      break;
+    case 'recalculate-services':
+      recalculateServices();
+      break;
+    case 'open-service-incident':
+      openIncidentFromService(e.currentTarget.dataset.id);
       break;
   }
 }
@@ -1544,6 +1569,542 @@ function showToast(msg) {
   div.textContent = msg;
   document.body.appendChild(div);
   setTimeout(() => div.remove(), 3000);
+}
+
+function healthColor(score) {
+  if (score >= 80) return '#22c55e';
+  if (score >= 60) return '#84cc16';
+  if (score >= 40) return '#fbbf24';
+  if (score >= 20) return '#f97316';
+  return '#ef4444';
+}
+
+function nodeRadius(incidentCount, maxCount) {
+  const min = 12, max = 40;
+  if (!maxCount || maxCount === 0) return min;
+  const t = Math.log(incidentCount + 1) / Math.log(maxCount + 1);
+  return min + t * (max - min);
+}
+
+function renderServicesPage() {
+  return `
+  <div class="services-page">
+    <header>
+      <h1>
+        <span style="cursor:pointer" data-action="go-back-list">←</span>
+        服务健康度与关联网络
+        <span style="font-size:12px;font-weight:400;color:var(--text2);">Top ${state.serviceNetwork.nodes.length} 服务</span>
+      </h1>
+      <div class="header-actions">
+        <button class="btn btn-outline btn-sm" data-action="recalculate-services">🔄 重算健康度</button>
+        <button class="btn btn-outline btn-sm" data-action="refresh-service-graph">↻ 刷新图表</button>
+      </div>
+    </header>
+    <div class="services-main">
+      <div class="services-graph-container" id="services-graph-container">
+        <div class="graph-controls">
+        </div>
+        <svg id="services-svg"></svg>
+        <div class="service-legend">
+          <h4>健康度分数</h4>
+          <div class="legend-gradient"></div>
+          <div class="legend-labels">
+            <span>100 (健康)</span>
+            <span>0 (危险)</span>
+          </div>
+        </div>
+      </div>
+      <div class="services-sidebar">
+        ${state.selectedServiceDetail ? renderServiceDetail() : `
+          <div class="service-detail-empty">
+            点击左侧节点查看服务详情<br><br>
+            节点大小 = 事故涉及次数<br>
+            节点颜色 = 健康度分数<br>
+            连接线 = 共同出现在同一事故
+          </div>
+        `}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderServiceDetail() {
+  const d = state.selectedServiceDetail;
+  if (!d) return '';
+  const h = d.health;
+  const incidents = d.incidents || [];
+  const trend = d.trend || [];
+
+  return `
+  <div class="service-detail">
+    <div class="service-detail-header">
+      <div>
+        <h2>${escapeHtml(h.service_name)}</h2>
+        <div style="font-size:12px;color:var(--text2);margin-top:4px;">
+          最后事故: ${h.last_incident_time ? h.last_incident_time.slice(0, 10) : '无'}
+        </div>
+      </div>
+      <div class="service-health-score" style="background:${healthColor(h.health_score)}">
+        <div class="score">${h.health_score}</div>
+        <div class="label">健康度</div>
+      </div>
+    </div>
+
+    <div class="severity-breakdown">
+      <div class="severity-chip severity-P0">P0 ${h.p0_count}</div>
+      <div class="severity-chip severity-P1">P1 ${h.p1_count}</div>
+      <div class="severity-chip severity-P2">P2 ${h.p2_count}</div>
+      <div class="severity-chip severity-P3">P3 ${h.p3_count}</div>
+    </div>
+
+    <div class="service-stats-grid">
+      <div class="service-stat">
+        <div class="service-stat-label">事故总数</div>
+        <div class="service-stat-value">${h.total_incidents}</div>
+      </div>
+      <div class="service-stat">
+        <div class="service-stat-label">平均故障间隔</div>
+        <div class="service-stat-value small">
+          ${h.avg_mtbf_days !== null && h.avg_mtbf_days !== undefined ? h.avg_mtbf_days.toFixed(1) + ' 天' : '-'}
+        </div>
+      </div>
+      <div class="service-stat">
+        <div class="service-stat-label">平均恢复时长</div>
+        <div class="service-stat-value small">
+          ${h.avg_recovery_minutes !== null && h.avg_recovery_minutes !== undefined ? Math.round(h.avg_recovery_minutes) + ' 分钟' : '-'}
+        </div>
+      </div>
+      <div class="service-stat">
+        <div class="service-stat-label">健康度</div>
+        <div class="service-stat-value" style="color:${healthColor(h.health_score)}">${h.health_score}</div>
+      </div>
+    </div>
+
+    <div class="section-title">近6个月事故趋势</div>
+    <div class="trend-chart-container">
+      <canvas id="service-trend-chart"></canvas>
+      <div class="trend-labels" id="trend-labels"></div>
+    </div>
+
+    <div class="section-title">关联事故 (最近 ${Math.min(10, incidents.length)} 条)</div>
+    <div class="service-incident-list">
+      ${incidents.length === 0 ? '<div style="color:var(--text2);font-size:12px;text-align:center;padding:16px;">暂无关联事故</div>' :
+        incidents.map(i => `
+          <div class="service-incident-item" data-action="open-service-incident" data-id="${i.id}">
+            <div class="service-incident-title">${escapeHtml(i.title)}</div>
+            <div class="service-incident-meta">
+              <span class="severity-badge severity-${i.severity}" style="padding:1px 6px;font-size:10px;">${i.severity}</span>
+              <span>${i.start_time ? i.start_time.slice(0, 10) : ''}</span>
+              <span class="status-tag ${i.status === 'open' ? 'status-open' : 'status-closed'}">${i.status === 'open' ? '进行中' : '已关闭'}</span>
+            </div>
+          </div>
+        `).join('')
+      }
+    </div>
+  </div>`;
+}
+
+function renderServiceTrendChart() {
+  const canvas = document.getElementById('service-trend-chart');
+  const labelsEl = document.getElementById('trend-labels');
+  if (!canvas || !labelsEl || !state.selectedServiceDetail) return;
+
+  const d = state.selectedServiceDetail;
+  const trend = d.trend || [];
+
+  const now = new Date();
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const dt = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+    const found = trend.find(t => t.month === key);
+    months.push({
+      key,
+      label: `${dt.getMonth() + 1}月`,
+      count: found ? found.count : 0
+    });
+  }
+
+  labelsEl.innerHTML = months.map(m => `<span>${m.label}</span>`).join('');
+
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth;
+  const H = 120;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+
+  const maxCount = Math.max(1, ...months.map(m => m.count));
+  const PAD_L = 28, PAD_R = 8, PAD_T = 12, PAD_B = 8;
+  const chartW = W - PAD_L - PAD_R;
+  const chartH = H - PAD_T - PAD_B;
+  const barW = chartW / months.length * 0.6;
+  const gap = chartW / months.length * 0.4;
+
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 0.5;
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'right';
+  const ticks = 4;
+  for (let i = 0; i <= ticks; i++) {
+    const y = PAD_T + chartH - (i / ticks) * chartH;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y);
+    ctx.lineTo(W - PAD_R, y);
+    ctx.stroke();
+    const val = Math.round(maxCount * i / ticks);
+    ctx.fillText(val, PAD_L - 4, y + 3);
+  }
+
+  months.forEach((m, i) => {
+    const prev = i > 0 ? months[i - 1].count : 0;
+    const worsened = prev > 0 && m.count > prev * 2;
+    const x = PAD_L + i * (barW + gap) + gap / 2;
+    const h = (m.count / maxCount) * chartH;
+    const y = PAD_T + chartH - h;
+
+    ctx.fillStyle = worsened ? '#ef4444' : '#3b82f6';
+    ctx.fillRect(x, y, barW, h);
+
+    if (m.count > 0) {
+      ctx.fillStyle = worsened ? '#ef4444' : '#f1f5f9';
+      ctx.font = 'bold 10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(m.count, x + barW / 2, y - 3);
+    }
+  });
+}
+
+let forceSim = null;
+
+function renderServiceGraph() {
+  const container = document.getElementById('services-graph-container');
+  const svgEl = document.getElementById('services-svg');
+  if (!container || !svgEl) return;
+
+  if (state.serviceGraphAnimId) {
+    cancelAnimationFrame(state.serviceGraphAnimId);
+    state.serviceGraphAnimId = null;
+  }
+
+  const W = container.clientWidth;
+  const H = container.clientHeight;
+  svgEl.setAttribute('width', W);
+  svgEl.setAttribute('height', H);
+  svgEl.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const ns = 'http://www.w3.org/2000/svg';
+  while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+
+  const nodes = state.serviceNetwork.nodes || [];
+  const edges = state.serviceNetwork.edges || [];
+
+  if (nodes.length === 0) return;
+
+  const maxIncidents = Math.max(...nodes.map(n => n.total_incidents), 1);
+
+  nodes.forEach(n => {
+    if (n.x === undefined) {
+      n.x = W / 2 + (Math.random() - 0.5) * W * 0.6;
+      n.y = H / 2 + (Math.random() - 0.5) * H * 0.6;
+    }
+    n.vx = n.vx || 0;
+    n.vy = n.vy || 0;
+    n._r = nodeRadius(n.total_incidents, maxIncidents);
+  });
+
+  const edgeG = document.createElementNS(ns, 'g');
+  svgEl.appendChild(edgeG);
+  edges.forEach(e => {
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('class', 'service-edge');
+    line.setAttribute('stroke-width', Math.max(1, Math.log(e.weight + 1) * 1.2));
+    edgeG.appendChild(line);
+    e._line = line;
+  });
+
+  const nodeG = document.createElementNS(ns, 'g');
+  svgEl.appendChild(nodeG);
+  nodes.forEach(n => {
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('class', 'service-node');
+    g.setAttribute('transform', `translate(${n.x},${n.y})`);
+
+    const circle = document.createElementNS(ns, 'circle');
+    circle.setAttribute('r', n._r);
+    circle.setAttribute('fill', healthColor(n.health_score));
+    circle.setAttribute('stroke', 'rgba(255,255,255,0.2)');
+    circle.setAttribute('stroke-width', '2');
+    g.appendChild(circle);
+
+    if (n._r >= 18) {
+      const text = document.createElementNS(ns, 'text');
+      text.setAttribute('y', 4);
+      const maxLen = Math.max(4, Math.floor(n._r / 5));
+      text.textContent = n.name.length > maxLen ? n.name.slice(0, maxLen) + '…' : n.name;
+      g.appendChild(text);
+    }
+
+    if (state.highlightServiceName === n.name) {
+      circle.classList.add('node-highlight');
+    }
+
+    g.title = n.name;
+    n._g = g;
+    n._circle = circle;
+
+    let dragging = false;
+    let dragOffset = { x: 0, y: 0 };
+
+    circle.addEventListener('mouseenter', () => {
+      if (!dragging) {
+        circle.setAttribute('stroke', 'rgba(255,255,255,0.8)');
+        circle.setAttribute('stroke-width', '3');
+      }
+    });
+    circle.addEventListener('mouseleave', () => {
+      if (!dragging && state.highlightServiceName !== n.name) {
+        circle.setAttribute('stroke', 'rgba(255,255,255,0.2)');
+        circle.setAttribute('stroke-width', '2');
+      }
+    });
+
+    circle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectService(n.name);
+    });
+
+    circle.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      dragging = true;
+      g.classList.add('dragging');
+      const rect = svgEl.getBoundingClientRect();
+      dragOffset.x = (e.clientX - rect.left) * (W / rect.width) - n.x;
+      dragOffset.y = (e.clientY - rect.top) * (H / rect.height) - n.y;
+      n.fx = n.x;
+      n.fy = n.y;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const rect = svgEl.getBoundingClientRect();
+      n.fx = Math.max(n._r, Math.min(W - n._r, (e.clientX - rect.left) * (W / rect.width) - dragOffset.x));
+      n.fy = Math.max(n._r, Math.min(H - n._r, (e.clientY - rect.top) * (H / rect.height) - dragOffset.y));
+      n.x = n.fx;
+      n.y = n.fy;
+      n.vx = 0;
+      n.vy = 0;
+      g.setAttribute('transform', `translate(${n.x},${n.y})`);
+      updateEdgePositions();
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (dragging) {
+        dragging = false;
+        g.classList.remove('dragging');
+        n.fx = undefined;
+        n.fy = undefined;
+      }
+    });
+
+    nodeG.appendChild(g);
+  });
+
+  function updateEdgePositions() {
+    edges.forEach(e => {
+      const src = nodes.find(n => n.id === e.source);
+      const tgt = nodes.find(n => n.id === e.target);
+      if (src && tgt && e._line) {
+        e._line.setAttribute('x1', src.x);
+        e._line.setAttribute('y1', src.y);
+        e._line.setAttribute('x2', tgt.x);
+        e._line.setAttribute('y2', tgt.y);
+      }
+    });
+  }
+
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.id] = n);
+
+  const centerX = W / 2, centerY = H / 2;
+  const alphaDecay = 0.02;
+  let alpha = 1;
+
+  function tick() {
+    alpha += (0 - alpha) * alphaDecay;
+    if (alpha < 0.005) alpha = 0;
+
+    nodes.forEach(n => {
+      if (n.fx !== undefined) { n.x = n.fx; n.vx = 0; }
+      if (n.fy !== undefined) { n.y = n.fy; n.vy = 0; }
+    });
+
+    edges.forEach(e => {
+      const a = nodeMap[e.source];
+      const b = nodeMap[e.target];
+      if (!a || !b) return;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const target = 120;
+      const force = (dist - target) * 0.005 * e.weight * alpha;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      if (a.fx === undefined) { a.vx += fx; }
+      if (a.fy === undefined) { a.vy += fy; }
+      if (b.fx === undefined) { b.vx -= fx; }
+      if (b.fy === undefined) { b.vy -= fy; }
+    });
+
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const distSq = dx * dx + dy * dy;
+        const minDist = (a._r + b._r + 20);
+        if (distSq < minDist * minDist && distSq > 0.01) {
+          const dist = Math.sqrt(distSq);
+          const force = (minDist - dist) * 0.3 * alpha;
+          const fx = (dx / dist) * force;
+          const fy = (dy / dist) * force;
+          if (a.fx === undefined) { a.vx -= fx; }
+          if (a.fy === undefined) { a.vy -= fy; }
+          if (b.fx === undefined) { b.vx += fx; }
+          if (b.fy === undefined) { b.vy += fy; }
+        }
+      }
+    }
+
+    nodes.forEach(n => {
+      if (n.fx === undefined) { n.vx += (centerX - n.x) * 0.001 * alpha; }
+      if (n.fy === undefined) { n.vy += (centerY - n.y) * 0.001 * alpha; }
+    });
+
+    nodes.forEach(n => {
+      n.vx *= 0.85;
+      n.vy *= 0.85;
+      if (n.fx === undefined) {
+        n.x += n.vx;
+        n.x = Math.max(n._r, Math.min(W - n._r, n.x));
+      }
+      if (n.fy === undefined) {
+        n.y += n.vy;
+        n.y = Math.max(n._r, Math.min(H - n._r, n.y));
+      }
+    });
+
+    nodes.forEach(n => {
+      if (n._g) n._g.setAttribute('transform', `translate(${n.x},${n.y})`);
+    });
+    updateEdgePositions();
+
+    if (alpha > 0) {
+      state.serviceGraphAnimId = requestAnimationFrame(tick);
+    } else {
+      state.serviceGraphAnimId = null;
+    }
+  }
+
+  tick();
+
+  if (state.highlightServiceName) {
+    const n = nodes.find(nd => nd.name === state.highlightServiceName);
+    if (n) {
+      setTimeout(() => selectService(n.name), 300);
+    }
+  }
+}
+
+async function selectService(serviceName) {
+  state.selectedService = serviceName;
+  try {
+    const res = await fetch(`${API}/services/${encodeURIComponent(serviceName)}`);
+    if (res.ok) {
+      state.selectedServiceDetail = await res.json();
+      render();
+    }
+  } catch (e) {
+    console.error('load service detail failed:', e);
+    showToast('加载服务详情失败');
+  }
+}
+
+async function goServices() {
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  state.view = 'services';
+  state.currentIncident = null;
+  state.selectedService = null;
+  state.selectedServiceDetail = null;
+  state.highlightServiceName = null;
+  await loadServiceNetwork();
+  render();
+}
+
+async function goServicesDetail(serviceName) {
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  state.view = 'services';
+  state.currentIncident = null;
+  state.selectedService = serviceName;
+  state.selectedServiceDetail = null;
+  state.highlightServiceName = serviceName;
+  await loadServiceNetwork();
+  render();
+  if (serviceName) {
+    try {
+      const res = await fetch(`${API}/services/${encodeURIComponent(serviceName)}`);
+      if (res.ok) {
+        state.selectedServiceDetail = await res.json();
+        render();
+      }
+    } catch (e) {
+      console.error('load service detail failed:', e);
+    }
+  }
+}
+
+async function loadServiceNetwork() {
+  try {
+    const res = await fetch(`${API}/services/network`);
+    if (res.ok) {
+      state.serviceNetwork = await res.json();
+    }
+  } catch (e) {
+    console.error('load service network failed:', e);
+    showToast('加载服务网络失败');
+  }
+}
+
+async function recalculateServices() {
+  try {
+    const res = await fetch(`${API}/services/recalculate`, { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      showToast(`已重新计算 ${data.recalculated} 个服务的健康度`);
+      await loadServiceNetwork();
+      state.selectedServiceDetail = null;
+      state.highlightServiceName = null;
+      render();
+    }
+  } catch (e) {
+    console.error('recalculate services failed:', e);
+    showToast('重算失败');
+  }
+}
+
+async function openIncidentFromService(incidentId) {
+  if (!state.userName) {
+    const name = prompt('请输入你的姓名:');
+    if (!name) return;
+    state.userName = name;
+    localStorage.setItem('tl_username', name);
+  }
+  await openIncident(incidentId);
 }
 
 loadIncidents();
