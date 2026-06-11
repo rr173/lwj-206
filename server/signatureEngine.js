@@ -90,22 +90,7 @@ function generateIncidentSignature(db, incidentId) {
     timeSpanSeconds = Math.round((maxTime - minTime) / 1000);
   }
 
-  const wordFreq = {};
-  nodes.forEach(n => {
-    const desc = n.description || '';
-    const tokens = tokenizeChinese(desc);
-    tokens.forEach(tok => {
-      const lower = tok.toLowerCase();
-      if (lower.length >= 2 && !STOPWORDS.has(lower)) {
-        wordFreq[lower] = (wordFreq[lower] || 0) + 1;
-      }
-    });
-  });
-
-  const keywords = Object.entries(wordFreq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(e => e[0]);
+  const keywords = extractKeywords(nodes, 12);
 
   let rootCauseDesc = null;
   if (nodes.length > 0) {
@@ -113,17 +98,35 @@ function generateIncidentSignature(db, incidentId) {
       SELECT from_node_id, to_node_id FROM causal_links WHERE incident_id = ?
     `, [incidentId]);
     const nodeIds = new Set(nodes.map(n => n.id));
+    const nodeMap = {};
+    nodes.forEach(n => { nodeMap[n.id] = n; });
+
+    const hasIncoming = new Set();
     const hasOutgoing = new Set();
     links.forEach(l => {
       if (nodeIds.has(l.from_node_id) && nodeIds.has(l.to_node_id)) {
         hasOutgoing.add(l.from_node_id);
+        hasIncoming.add(l.to_node_id);
       }
     });
-    const sinks = nodes.filter(n => !hasOutgoing.has(n.id));
-    if (sinks.length === 1) {
-      rootCauseDesc = sinks[0].description;
-    } else if (sinks.length > 1) {
-      rootCauseDesc = sinks.map(s => s.description).join(' | ');
+
+    const onCausalChain = new Set([...hasIncoming, ...hasOutgoing]);
+    const rootCauses = nodes.filter(n =>
+      onCausalChain.has(n.id) && !hasIncoming.has(n.id)
+    );
+
+    rootCauses.sort((a, b) => new Date(a.occurred_at) - new Date(b.occurred_at));
+
+    if (rootCauses.length === 1) {
+      rootCauseDesc = rootCauses[0].description;
+    } else if (rootCauses.length > 1) {
+      const topRoots = rootCauses.slice(0, 3);
+      rootCauseDesc = topRoots.map(r => r.description).join(' | ');
+    } else if (nodes.length > 0 && onCausalChain.size === 0) {
+      const sortedNodes = [...nodes].sort((a, b) =>
+        new Date(a.occurred_at) - new Date(b.occurred_at)
+      );
+      rootCauseDesc = sortedNodes[0].description;
     }
   }
 
@@ -204,6 +207,41 @@ function tokenizeChinese(text) {
   return tokens;
 }
 
+function extractKeywords(nodes, topN = 12) {
+  const wordFreq = {};
+  nodes.forEach(n => {
+    const desc = n.description || '';
+    const tokens = tokenizeChinese(desc);
+    tokens.forEach(tok => {
+      const lower = tok.toLowerCase();
+      if (lower.length >= 2 && !STOPWORDS.has(lower)) {
+        wordFreq[lower] = (wordFreq[lower] || 0) + 1;
+      }
+    });
+  });
+
+  const entries = Object.entries(wordFreq).map(([word, freq]) => ({
+    word,
+    freq,
+    score: freq * Math.log2(word.length + 1)
+  }));
+
+  entries.sort((a, b) => b.score - a.score || b.freq - a.freq || b.word.length - a.word.length);
+
+  const selected = [];
+  for (const candidate of entries) {
+    if (selected.length >= topN) break;
+    const isRedundant = selected.some(s =>
+      s.word.includes(candidate.word) && s.freq >= candidate.freq * 0.5
+    );
+    if (!isRedundant) {
+      selected.push(candidate);
+    }
+  }
+
+  return selected.map(s => s.word);
+}
+
 function buildLiveSignature(db, incidentId) {
   const nodes = runQuery(db, `
     SELECT * FROM timeline_nodes 
@@ -224,21 +262,7 @@ function buildLiveSignature(db, incidentId) {
     sourceTypeDist[k] = total > 0 ? sourceTypeCounts[k] / total : 0;
   });
 
-  const wordFreq = {};
-  nodes.forEach(n => {
-    const desc = n.description || '';
-    const tokens = tokenizeChinese(desc);
-    tokens.forEach(tok => {
-      const lower = tok.toLowerCase();
-      if (lower.length >= 2 && !STOPWORDS.has(lower)) {
-        wordFreq[lower] = (wordFreq[lower] || 0) + 1;
-      }
-    });
-  });
-  const keywords = Object.entries(wordFreq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(e => e[0]);
+  const keywords = extractKeywords(nodes, 12);
 
   return { services, sourceTypeDist, keywords };
 }
