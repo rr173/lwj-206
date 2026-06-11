@@ -755,6 +755,12 @@ function triggerAsyncMatching(db, wss, incidentId) {
       runExec(db, `INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [crypto.randomUUID(), id, normTime, tn.description_template, tn.source_type, tn.service_name, ownerName || 'template', tn.sequence]);
     });
+
+    if (tmplNodes.length > 0) {
+      const services = [...new Set(tmplNodes.map(tn => tn.service_name))];
+      dispatchOncallPersons(db, req.uuidv4, wss, id, services, new Date());
+    }
+
     const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
     res.status(201).json(incident);
   });

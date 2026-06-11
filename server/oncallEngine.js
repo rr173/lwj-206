@@ -181,6 +181,25 @@ function getAllServicesWithPlans(db) {
   }));
 }
 
+function checkServiceConflicts(db, services, excludePlanId = null) {
+  const existingPlans = runQuery(db, `
+    SELECT id, name, services FROM oncall_plans
+    WHERE is_active = 1
+  `);
+
+  const conflicts = [];
+  for (const plan of existingPlans) {
+    if (excludePlanId && plan.id === excludePlanId) continue;
+    const planServices = JSON.parse(plan.services || '[]');
+    for (const svc of services) {
+      if (planServices.includes(svc)) {
+        conflicts.push({ service: svc, planId: plan.id, planName: plan.name });
+      }
+    }
+  }
+  return conflicts;
+}
+
 function createPlan(db, uuidv4, { name, services, startDate, members }) {
   if (!name || !services || !Array.isArray(services) || services.length === 0) {
     throw new Error('name and services array required');
@@ -190,6 +209,12 @@ function createPlan(db, uuidv4, { name, services, startDate, members }) {
   }
   if (!startDate) {
     throw new Error('startDate required');
+  }
+
+  const conflicts = checkServiceConflicts(db, services);
+  if (conflicts.length > 0) {
+    const conflictInfo = conflicts.map(c => `${c.service} (已在计划"${c.planName}"中)`).join(', ');
+    throw new Error(`服务冲突: ${conflictInfo}。同一服务同一时间只能有一个生效的值班计划。`);
   }
 
   const planId = uuidv4();
@@ -211,6 +236,17 @@ function createPlan(db, uuidv4, { name, services, startDate, members }) {
 function updatePlan(db, planId, { name, services, members, isActive }) {
   const plan = getPlanById(db, planId);
   if (!plan) throw new Error('plan not found');
+
+  const finalServices = services !== undefined && Array.isArray(services) ? services : plan.services;
+  const finalIsActive = isActive !== undefined ? isActive : !!plan.is_active;
+
+  if (finalIsActive) {
+    const conflicts = checkServiceConflicts(db, finalServices, planId);
+    if (conflicts.length > 0) {
+      const conflictInfo = conflicts.map(c => `${c.service} (已在计划"${c.planName}"中)`).join(', ');
+      throw new Error(`服务冲突: ${conflictInfo}。同一服务同一时间只能有一个生效的值班计划。`);
+    }
+  }
 
   if (name !== undefined) {
     runExec(db, `UPDATE oncall_plans SET name = ?, updated_at = datetime('now') WHERE id = ?`, [name, planId]);
@@ -338,7 +374,7 @@ function checkAndUpgradeIncidents(db, uuidv4, wss) {
   `, [fifteenMinutesAgo.toISOString()]);
 
   for (const incident of openIncidents) {
-    const hasActivity = hasIncidentActivity(db, incident.id, incident.created_at);
+    const hasActivity = hasIncidentActivity(db, incident.id, fifteenMinutesAgo.toISOString());
     if (hasActivity) continue;
 
     const dispatches = getDispatchesForIncident(db, incident.id);
@@ -463,6 +499,7 @@ module.exports = {
   getOncallPersonForService,
   getWeeklySchedule,
   getAllServicesWithPlans,
+  checkServiceConflicts,
   createPlan,
   updatePlan,
   deletePlan,
