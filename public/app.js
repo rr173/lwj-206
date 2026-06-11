@@ -46,7 +46,16 @@ let state = {
   selectedService: null,
   selectedServiceDetail: null,
   highlightServiceName: null,
-  serviceGraphAnimId: null
+  serviceGraphAnimId: null,
+  oncallServices: [],
+  oncallSchedules: {},
+  oncallWeekStart: null,
+  oncallSelectedService: null,
+  oncallPlans: [],
+  showOncallPlanModal: false,
+  editingPlanId: null,
+  showSwapModal: false,
+  swapData: null
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -66,6 +75,8 @@ function render() {
         renderServiceTrendChart();
       }
     }, 0);
+  } else if (state.view === 'oncall') {
+    app.innerHTML = renderOncallPage();
   } else {
     app.innerHTML = renderTimeline();
     renderTimelineGraphics();
@@ -95,6 +106,7 @@ function renderIncidentList() {
       <button class="btn btn-outline" data-action="show-template-list">📋 模板管理</button>
       <button class="btn btn-outline" data-action="go-stats">📊 评分统计</button>
       <button class="btn btn-outline" data-action="go-services">🌐 服务健康度</button>
+      <button class="btn btn-outline" data-action="go-oncall">📅 值班排班</button>
     </div>
     <div class="incident-cards">${cards || '<div class="empty-state">暂无事故记录</div>'}</div>
     ${state.showCreateIncident ? renderCreateIncidentModal() : ''}
@@ -882,6 +894,17 @@ function handleAction(e) {
     case 'go-stats': goStats(); break;
     case 'go-services': goServices(); break;
     case 'go-services-detail': goServicesDetail(e.currentTarget.dataset.service); break;
+    case 'go-oncall': goOncall(); break;
+    case 'oncall-prev-week': oncallPrevWeek(); break;
+    case 'oncall-next-week': oncallNextWeek(); break;
+    case 'oncall-show-plan-modal': state.showOncallPlanModal = true; state.editingPlanId = null; render(); break;
+    case 'oncall-edit-plan': state.showOncallPlanModal = true; state.editingPlanId = e.currentTarget.dataset.id; render(); break;
+    case 'oncall-delete-plan': deleteOncallPlan(e.currentTarget.dataset.id); break;
+    case 'oncall-close-plan-modal': state.showOncallPlanModal = false; state.editingPlanId = null; render(); break;
+    case 'oncall-save-plan': saveOncallPlan(); break;
+    case 'oncall-show-swap-modal': showSwapModal(e.currentTarget.dataset); break;
+    case 'oncall-close-swap-modal': state.showSwapModal = false; state.swapData = null; render(); break;
+    case 'oncall-save-swap': saveSwap(); break;
     case 'go-back-list': leaveToStatsOrList(); break;
     case 'show-review-form': state.showReviewForm = true; render(); break;
     case 'cancel-review': state.showReviewForm = false; render(); break;
@@ -1399,8 +1422,11 @@ async function goStats() {
 }
 
 function leaveToStatsOrList() {
+  history.pushState({}, '', '/');
   state.view = 'list';
   state.reviewStats = null;
+  state.currentIncident = null;
+  if (state.ws) { state.ws.close(); state.ws = null; }
   loadIncidents();
 }
 
@@ -2107,4 +2133,440 @@ async function openIncidentFromService(incidentId) {
   await openIncident(incidentId);
 }
 
+async function goOncall(updateUrl = true) {
+  if (updateUrl) history.pushState({}, '', '/oncall');
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  state.view = 'oncall';
+  state.currentIncident = null;
+  state.showOncallPlanModal = false;
+  state.editingPlanId = null;
+  state.showSwapModal = false;
+  state.swapData = null;
+  if (!state.oncallWeekStart) {
+    const now = new Date();
+    const day = now.getDay();
+    state.oncallWeekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
+  }
+  await loadOncallData();
+  render();
+}
+
+async function loadOncallData() {
+  try {
+    const [servicesRes, plansRes] = await Promise.all([
+      fetch(`${API}/oncall/services`),
+      fetch(`${API}/oncall/plans`)
+    ]);
+    state.oncallServices = await servicesRes.json();
+    state.oncallPlans = await plansRes.json();
+
+    state.oncallSchedules = {};
+    const weekStartStr = formatDate(state.oncallWeekStart);
+    for (const svc of state.oncallServices) {
+      try {
+        const res = await fetch(`${API}/oncall/schedule?service=${encodeURIComponent(svc.serviceName)}&weekStart=${weekStartStr}`);
+        const data = await res.json();
+        if (data.schedule) {
+          state.oncallSchedules[svc.serviceName] = data.schedule;
+        }
+      } catch (e) {
+        console.error(`load schedule for ${svc.serviceName} failed:`, e);
+      }
+    }
+  } catch (e) {
+    console.error('load oncall data failed:', e);
+    showToast('加载值班数据失败');
+  }
+}
+
+function oncallPrevWeek() {
+  state.oncallWeekStart = new Date(state.oncallWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+  loadOncallData().then(render);
+}
+
+function oncallNextWeek() {
+  state.oncallWeekStart = new Date(state.oncallWeekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+  loadOncallData().then(render);
+}
+
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function renderOncallPage() {
+  const weekStart = state.oncallWeekStart;
+  const weekEnd = new Date(weekStart.getTime() + 6 * 24 * 60 * 60 * 1000);
+  const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+  const headerCells = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(weekStart.getTime() + i * 24 * 60 * 60 * 1000);
+    const isToday = formatDate(d) === formatDate(new Date());
+    headerCells.push(`
+      <th class="${isToday ? 'oncall-today' : ''}">
+        ${dayNames[i]}<br>
+        <small>${formatDate(d).slice(5)}</small>
+      </th>
+    `);
+  }
+
+  const serviceRows = state.oncallServices.map(svc => {
+    const schedule = state.oncallSchedules[svc.serviceName];
+    const shiftRows = [];
+
+    for (let shiftIdx = 0; shiftIdx < 3; shiftIdx++) {
+      const shiftName = ['早班(00-08)', '中班(08-16)', '晚班(16-24)'][shiftIdx];
+      const cells = [];
+
+      for (let dayIdx = 0; dayIdx < 7; dayIdx++) {
+        const d = new Date(weekStart.getTime() + dayIdx * 24 * 60 * 60 * 1000);
+        const dateStr = formatDate(d);
+        const isToday = dateStr === formatDate(new Date());
+
+        let cellContent = '<span class="oncall-empty">-</span>';
+        let cellClass = isToday ? 'oncall-today' : '';
+
+        if (schedule && schedule.schedule[dayIdx]) {
+          const shift = schedule.schedule[dayIdx].shifts[shiftIdx];
+          if (shift) {
+            const swapBadge = shift.isSwapped ? `<span class="swap-badge" title="${shift.originalUser} → ${shift.actualUser}">换班</span>` : '';
+            cellContent = `
+              <div class="oncall-cell-content">
+                <span class="oncall-user ${shift.isSwapped ? 'oncall-swapped' : ''}">${shift.actualUser}</span>
+                ${swapBadge}
+                <button class="oncall-swap-btn" data-action="oncall-show-swap-modal" 
+                  data-service="${svc.serviceName}" 
+                  data-plan="${schedule.planId}"
+                  data-date="${dateStr}"
+                  data-shift="${shiftIdx}"
+                  data-original="${shift.originalUser}"
+                  title="换班">↔</button>
+              </div>
+            `;
+          }
+        }
+
+        cells.push(`<td class="${cellClass}">${cellContent}</td>`);
+      }
+
+      shiftRows.push(`
+        <tr>
+          ${shiftIdx === 0 ? `<td class="oncall-service-cell" rowspan="3">
+            <div class="oncall-service-name">${svc.serviceName}</div>
+            <div class="oncall-plan-name">${svc.planName}</div>
+          </td>` : ''}
+          <td class="oncall-shift-cell">${shiftName}</td>
+          ${cells.join('')}
+        </tr>
+      `);
+    }
+
+    return shiftRows.join('');
+  }).join('');
+
+  const plansList = state.oncallPlans.map(plan => `
+    <div class="oncall-plan-card">
+      <div class="oncall-plan-header">
+        <strong>${plan.name}</strong>
+        <span class="oncall-plan-status ${plan.is_active ? 'active' : 'inactive'}">
+          ${plan.is_active ? '生效中' : '已停用'}
+        </span>
+      </div>
+      <div class="oncall-plan-services">
+        <label>服务:</label> ${plan.services.join(', ')}
+      </div>
+      <div class="oncall-plan-members">
+        <label>人员:</label> ${plan.members.map(m => m.userName).join(' → ')}
+      </div>
+      <div class="oncall-plan-actions">
+        <button class="btn btn-small" data-action="oncall-edit-plan" data-id="${plan.id}">编辑</button>
+        <button class="btn btn-small btn-danger" data-action="oncall-delete-plan" data-id="${plan.id}">删除</button>
+      </div>
+    </div>
+  `).join('');
+
+  return `
+    <div class="oncall-page">
+      <div class="oncall-header">
+        <h1>📅 值班排班</h1>
+        <div class="oncall-controls">
+          <button class="btn btn-outline" data-action="go-back-list">← 返回列表</button>
+          <button class="btn btn-outline" data-action="oncall-prev-week">← 上周</button>
+          <span class="oncall-week-label">${formatDate(weekStart)} ~ ${formatDate(weekEnd)}</span>
+          <button class="btn btn-outline" data-action="oncall-next-week">下周 →</button>
+          <button class="btn btn-primary" data-action="oncall-show-plan-modal">+ 新建值班计划</button>
+        </div>
+      </div>
+
+      <div class="oncall-container">
+        <div class="oncall-schedule-section">
+          <h2>本周排班</h2>
+          ${state.oncallServices.length === 0 ? 
+            '<div class="empty-state">暂无值班计划，点击右上角按钮创建</div>' : `
+            <table class="oncall-table">
+              <thead>
+                <tr>
+                  <th style="width:80px;">服务</th>
+                  <th style="width:100px;">班次</th>
+                  ${headerCells.join('')}
+                </tr>
+              </thead>
+              <tbody>
+                ${serviceRows}
+              </tbody>
+            </table>
+          `}
+        </div>
+
+        <div class="oncall-plans-section">
+          <h2>值班计划管理</h2>
+          <div class="oncall-plans-list">
+            ${plansList || '<div class="empty-state">暂无值班计划</div>'}
+          </div>
+        </div>
+      </div>
+
+      ${state.showOncallPlanModal ? renderOncallPlanModal() : ''}
+      ${state.showSwapModal ? renderSwapModal() : ''}
+    </div>
+  `;
+}
+
+function renderOncallPlanModal() {
+  const editingPlan = state.editingPlanId ? 
+    state.oncallPlans.find(p => p.id === state.editingPlanId) : null;
+
+  const title = editingPlan ? '编辑值班计划' : '新建值班计划';
+  const name = editingPlan ? editingPlan.name : '';
+  const services = editingPlan ? editingPlan.services.join(', ') : '';
+  const members = editingPlan ? editingPlan.members.map(m => m.userName).join(', ') : '';
+  const startDate = editingPlan ? editingPlan.start_date : formatDate(new Date());
+  const isActive = editingPlan ? editingPlan.is_active : 1;
+
+  return `
+    <div class="modal-overlay" data-action="oncall-close-plan-modal">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>${title}</h3>
+          <button class="modal-close" data-action="oncall-close-plan-modal">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>计划名称 *</label>
+            <input type="text" id="plan-name" value="${escapeHtml(name)}" placeholder="如：核心服务值班组">
+          </div>
+          <div class="form-group">
+            <label>服务列表 * (逗号分隔)</label>
+            <input type="text" id="plan-services" value="${escapeHtml(services)}" placeholder="如：payment-gateway, order-service">
+          </div>
+          <div class="form-group">
+            <label>值班人员 * (逗号分隔，按排班顺序)</label>
+            <input type="text" id="plan-members" value="${escapeHtml(members)}" placeholder="如：alice, bob, carol">
+          </div>
+          <div class="form-group">
+            <label>开始日期 *</label>
+            <input type="date" id="plan-start-date" value="${startDate}">
+          </div>
+          ${editingPlan ? `
+            <div class="form-group">
+              <label>
+                <input type="checkbox" id="plan-active" ${isActive ? 'checked' : ''}>
+                启用该计划
+              </label>
+            </div>
+          ` : ''}
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline" data-action="oncall-close-plan-modal">取消</button>
+          <button class="btn btn-primary" data-action="oncall-save-plan">保存</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function saveOncallPlan() {
+  const name = document.getElementById('plan-name').value.trim();
+  const servicesStr = document.getElementById('plan-services').value.trim();
+  const membersStr = document.getElementById('plan-members').value.trim();
+  const startDate = document.getElementById('plan-start-date').value;
+
+  if (!name || !servicesStr || !membersStr || !startDate) {
+    showToast('请填写所有必填项');
+    return;
+  }
+
+  const services = servicesStr.split(',').map(s => s.trim()).filter(s => s);
+  const members = membersStr.split(',').map(s => s.trim()).filter(s => s);
+
+  if (services.length === 0 || members.length === 0) {
+    showToast('服务和人员列表不能为空');
+    return;
+  }
+
+  const payload = { name, services, startDate, members };
+  if (state.editingPlanId) {
+    const activeCheckbox = document.getElementById('plan-active');
+    if (activeCheckbox) {
+      payload.isActive = activeCheckbox.checked;
+    }
+  }
+
+  try {
+    const url = state.editingPlanId ? 
+      `${API}/oncall/plans/${state.editingPlanId}` : 
+      `${API}/oncall/plans`;
+    const method = state.editingPlanId ? 'PUT' : 'POST';
+
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (res.ok) {
+      showToast(state.editingPlanId ? '已更新值班计划' : '已创建值班计划');
+      state.showOncallPlanModal = false;
+      state.editingPlanId = null;
+      await loadOncallData();
+      render();
+    } else {
+      const err = await res.json();
+      showToast(err.error || '保存失败');
+    }
+  } catch (e) {
+    console.error('save oncall plan failed:', e);
+    showToast('保存失败');
+  }
+}
+
+async function deleteOncallPlan(planId) {
+  if (!confirm('确定要删除这个值班计划吗？')) return;
+
+  try {
+    const res = await fetch(`${API}/oncall/plans/${planId}`, { method: 'DELETE' });
+    if (res.ok) {
+      showToast('已删除值班计划');
+      await loadOncallData();
+      render();
+    } else {
+      showToast('删除失败');
+    }
+  } catch (e) {
+    console.error('delete oncall plan failed:', e);
+    showToast('删除失败');
+  }
+}
+
+function showSwapModal(data) {
+  state.showSwapModal = true;
+  state.swapData = {
+    planId: data.plan,
+    shiftDate: data.date,
+    shiftIndex: parseInt(data.shift),
+    originalUser: data.original,
+    serviceName: data.service
+  };
+  render();
+}
+
+function renderSwapModal() {
+  const data = state.swapData;
+  if (!data) return '';
+
+  const shiftName = ['早班(00-08)', '中班(08-16)', '晚班(16-24)'][data.shiftIndex];
+  const plan = state.oncallPlans.find(p => p.id === data.planId);
+  const members = plan ? plan.members.map(m => m.userName).filter(u => u !== data.originalUser) : [];
+
+  return `
+    <div class="modal-overlay" data-action="oncall-close-swap-modal">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h3>临时换班</h3>
+          <button class="modal-close" data-action="oncall-close-swap-modal">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="swap-info">
+            <p><strong>服务:</strong> ${data.serviceName}</p>
+            <p><strong>日期:</strong> ${data.shiftDate}</p>
+            <p><strong>班次:</strong> ${shiftName}</p>
+            <p><strong>原值班人:</strong> ${data.originalUser}</p>
+          </div>
+          <div class="form-group">
+            <label>替班人员 *</label>
+            ${members.length > 0 ? `
+              <select id="swap-substitute">
+                <option value="">请选择替班人员</option>
+                ${members.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
+              </select>
+            ` : `
+              <input type="text" id="swap-substitute" placeholder="输入替班人员姓名">
+            `}
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-outline" data-action="oncall-close-swap-modal">取消</button>
+          <button class="btn btn-primary" data-action="oncall-save-swap">确认换班</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function saveSwap() {
+  const substituteUser = document.getElementById('swap-substitute').value.trim();
+  if (!substituteUser) {
+    showToast('请选择或输入替班人员');
+    return;
+  }
+
+  const data = state.swapData;
+  try {
+    const res = await fetch(`${API}/oncall/swaps`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        planId: data.planId,
+        originalUser: data.originalUser,
+        substituteUser,
+        shiftDate: data.shiftDate,
+        shiftIndex: data.shiftIndex,
+        createdBy: state.userName || 'system'
+      })
+    });
+
+    if (res.ok) {
+      showToast('换班成功');
+      state.showSwapModal = false;
+      state.swapData = null;
+      await loadOncallData();
+      render();
+    } else {
+      const err = await res.json();
+      showToast(err.error || '换班失败');
+    }
+  } catch (e) {
+    console.error('save swap failed:', e);
+    showToast('换班失败');
+  }
+}
+
+function handleRoute() {
+  const path = window.location.pathname;
+  if (path === '/oncall') {
+    goOncall(false);
+  }
+}
+
+window.addEventListener('popstate', handleRoute);
+
+function navigateTo(path) {
+  history.pushState({}, '', path);
+  handleRoute();
+}
+
 loadIncidents();
+handleRoute();

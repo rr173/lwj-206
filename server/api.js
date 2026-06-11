@@ -2,6 +2,7 @@ const express = require('express');
 const { getDb, runQuery, runExec } = require('./db');
 const signatureEngine = require('./signatureEngine');
 const serviceHealthEngine = require('./serviceHealthEngine');
+const oncallEngine = require('./oncallEngine');
 
 const pendingMatching = new Set();
 
@@ -11,6 +12,93 @@ function normalizeTime(t) {
   if (isNaN(d.getTime())) return t;
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function dispatchOncallPersons(db, uuidv4, wss, incidentId, services, atTime) {
+  const inc = runQuery(db, 'SELECT status FROM incidents WHERE id = ?', [incidentId])[0];
+  if (!inc || inc.status === 'closed') return [];
+
+  const existingDispatches = oncallEngine.getDispatchesForIncident(db, incidentId);
+  const dispatchedUsers = new Set(existingDispatches.map(d => d.user_name));
+  const dispatchedServices = new Set(existingDispatches.map(d => d.service_name));
+
+  const addedParticipants = [];
+  const uniqueServices = [...new Set(services)];
+
+  for (const serviceName of uniqueServices) {
+    if (dispatchedServices.has(serviceName)) continue;
+
+    const oncall = oncallEngine.getOncallPersonForService(db, serviceName, atTime);
+    if (!oncall) continue;
+
+    oncallEngine.recordDispatch(db, uuidv4, {
+      incidentId,
+      serviceName,
+      userName: oncall.userName,
+      dispatchType: 'auto'
+    });
+
+    if (!dispatchedUsers.has(oncall.userName)) {
+      const existingParticipant = runQuery(db, `
+        SELECT * FROM participants WHERE incident_id = ? AND user_name = ?
+      `, [incidentId, oncall.userName])[0];
+
+      if (!existingParticipant) {
+        const participantId = uuidv4();
+        runExec(db, `
+          INSERT INTO participants (id, incident_id, user_name, role)
+          VALUES (?, ?, ?, 'oncall')
+        `, [participantId, incidentId, oncall.userName]);
+
+        addedParticipants.push({
+          id: participantId,
+          incidentId,
+          userName: oncall.userName,
+          role: 'oncall',
+          serviceName
+        });
+
+        if (wss && wss.broadcast) {
+          wss.broadcast(incidentId, {
+            type: 'participant_joined',
+            participant: {
+              id: participantId,
+              incidentId,
+              userName: oncall.userName,
+              role: 'oncall'
+            }
+          });
+        }
+
+        dispatchedUsers.add(oncall.userName);
+      }
+    }
+  }
+
+  if (addedParticipants.length > 0) {
+    runExec(db, `
+      INSERT INTO operation_logs (id, incident_id, user_name, action, target_type, target_id, detail)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [
+      uuidv4(),
+      incidentId,
+      'system',
+      'auto_dispatch',
+      'incident',
+      incidentId,
+      JSON.stringify({ dispatched: addedParticipants })
+    ]);
+
+    if (wss && wss.broadcast) {
+      wss.broadcast(incidentId, {
+        type: 'auto_dispatched',
+        incidentId,
+        participants: addedParticipants
+      });
+    }
+  }
+
+  return addedParticipants;
 }
 
 function createApiRouter(wss) {
@@ -175,6 +263,16 @@ function triggerAsyncMatching(db, wss, incidentId) {
       runExec(db, `INSERT INTO participants (id, incident_id, user_name, role) VALUES (?, ?, ?, 'owner')`,
         [crypto.randomUUID(), id, ownerName]);
     }
+
+    const existingNodes = runQuery(db, `
+      SELECT DISTINCT service_name FROM timeline_nodes
+      WHERE incident_id = ? AND is_excluded = 0
+    `, [id]);
+    if (existingNodes.length > 0) {
+      const services = existingNodes.map(n => n.service_name);
+      dispatchOncallPersons(db, req.uuidv4, wss, id, services, new Date());
+    }
+
     const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
     res.status(201).json(incident);
   });
@@ -280,6 +378,20 @@ function triggerAsyncMatching(db, wss, incidentId) {
     broadcast(req.params.incidentId, { type: 'node_added', node });
     pushSync(db, req.params.incidentId, 'node_added', { node });
     triggerAsyncMatching(db, wss, req.params.incidentId);
+
+    const nodeCountBefore = runQuery(db, `
+      SELECT COUNT(*) as c FROM timeline_nodes
+      WHERE incident_id = ? AND is_excluded = 0 AND id != ?
+    `, [req.params.incidentId, id])[0].c;
+    if (nodeCountBefore === 0) {
+      const allNodes = runQuery(db, `
+        SELECT DISTINCT service_name FROM timeline_nodes
+        WHERE incident_id = ? AND is_excluded = 0
+      `, [req.params.incidentId]);
+      const services = allNodes.map(n => n.service_name);
+      dispatchOncallPersons(db, req.uuidv4, wss, req.params.incidentId, services, new Date());
+    }
+
     res.status(201).json(node);
   });
 
@@ -811,6 +923,140 @@ function triggerAsyncMatching(db, wss, incidentId) {
       res.json({ recalculated: results.length, results });
     } catch (e) {
       console.error('recalculate services error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/plans', (req, res) => {
+    try {
+      const plans = oncallEngine.getAllPlans(req.db);
+      res.json(plans);
+    } catch (e) {
+      console.error('get oncall plans error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/plans/:id', (req, res) => {
+    try {
+      const plan = oncallEngine.getPlanById(req.db, req.params.id);
+      if (!plan) return res.status(404).json({ error: 'plan not found' });
+      res.json(plan);
+    } catch (e) {
+      console.error('get oncall plan error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.post('/oncall/plans', (req, res) => {
+    try {
+      const { name, services, startDate, members } = req.body;
+      const plan = oncallEngine.createPlan(req.db, req.uuidv4, { name, services, startDate, members });
+      res.status(201).json(plan);
+    } catch (e) {
+      console.error('create oncall plan error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.put('/oncall/plans/:id', (req, res) => {
+    try {
+      const { name, services, members, isActive } = req.body;
+      const plan = oncallEngine.updatePlan(req.db, req.params.id, { name, services, members, isActive });
+      res.json(plan);
+    } catch (e) {
+      console.error('update oncall plan error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.delete('/oncall/plans/:id', (req, res) => {
+    try {
+      oncallEngine.deletePlan(req.db, req.params.id);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('delete oncall plan error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/current', (req, res) => {
+    try {
+      const { service, time } = req.query;
+      if (!service) return res.status(400).json({ error: 'service required' });
+      const atTime = time ? new Date(time) : new Date();
+      const oncall = oncallEngine.getOncallPersonForService(req.db, service, atTime);
+      if (!oncall) return res.json({ oncall: null });
+      res.json({ oncall });
+    } catch (e) {
+      console.error('get current oncall error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/schedule', (req, res) => {
+    try {
+      const { service, weekStart } = req.query;
+      if (!service) return res.status(400).json({ error: 'service required' });
+
+      let startDate;
+      if (weekStart) {
+        startDate = new Date(weekStart);
+      } else {
+        startDate = new Date();
+        const day = startDate.getDay();
+        startDate.setDate(startDate.getDate() - day);
+      }
+      startDate.setHours(0, 0, 0, 0);
+
+      const schedule = oncallEngine.getWeeklySchedule(req.db, service, startDate);
+      if (!schedule) return res.json({ schedule: null });
+      res.json({ schedule });
+    } catch (e) {
+      console.error('get oncall schedule error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/services', (req, res) => {
+    try {
+      const services = oncallEngine.getAllServicesWithPlans(req.db);
+      res.json(services);
+    } catch (e) {
+      console.error('get oncall services error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.post('/oncall/swaps', (req, res) => {
+    try {
+      const { planId, originalUser, substituteUser, shiftDate, shiftIndex, createdBy } = req.body;
+      const swap = oncallEngine.createSwap(req.db, req.uuidv4, {
+        planId, originalUser, substituteUser, shiftDate, shiftIndex, createdBy
+      });
+      res.status(201).json(swap);
+    } catch (e) {
+      console.error('create oncall swap error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.get('/oncall/plans/:id/swaps', (req, res) => {
+    try {
+      const swaps = oncallEngine.getSwapsForPlan(req.db, req.params.id);
+      res.json(swaps);
+    } catch (e) {
+      console.error('get oncall swaps error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/oncall/dispatches/:incidentId', (req, res) => {
+    try {
+      const dispatches = oncallEngine.getDispatchesForIncident(req.db, req.params.incidentId);
+      res.json(dispatches);
+    } catch (e) {
+      console.error('get oncall dispatches error:', e);
       res.status(500).json({ error: 'internal error' });
     }
   });

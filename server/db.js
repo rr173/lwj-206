@@ -228,6 +228,51 @@ function initSchema() {
       UNIQUE(service_a, service_b)
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS oncall_plans (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      services TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS oncall_plan_members (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(plan_id, user_name),
+      UNIQUE(plan_id, position)
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS oncall_swaps (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      original_user TEXT NOT NULL,
+      substitute_user TEXT NOT NULL,
+      shift_date TEXT NOT NULL,
+      shift_index INTEGER NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS oncall_dispatches (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      dispatched_at TEXT NOT NULL,
+      dispatch_type TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
 }
 
 function rowToObject(row, columns) {
@@ -282,8 +327,16 @@ function runExec(dbOrSql, sqlOrParams, maybeParams) {
 }
 
 function seedDemoIfEmpty() {
+  const { seedDemoOncallData } = require('./oncallEngine');
   const count = runQuery(db, 'SELECT COUNT(*) as c FROM incidents')[0].c;
-  if (count > 0) return;
+  if (count > 0) {
+    try {
+      seedDemoOncallData(db, uuidv4);
+    } catch (e) {
+      console.error('seed oncall demo data error:', e);
+    }
+    return;
+  }
 
   const incidentId = uuidv4();
   const roomCode = 'DEMO-P1-2026';
@@ -360,6 +413,12 @@ function seedDemoIfEmpty() {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [n.id, incident2Id, n.time, n.desc, n.src, n.svc, n.by, i]);
   });
+
+  try {
+    seedDemoOncallData(db, uuidv4);
+  } catch (e) {
+    console.error('seed oncall demo data error:', e);
+  }
 }
 
 module.exports = { getDb, saveDb, runQuery, runExec };
