@@ -29,6 +29,19 @@ let state = {
   currentReview: null,
   showReviewForm: false,
   reviewStats: null,
+  similarIncidents: {
+    matches: [],
+    kbEmpty: false,
+    needsMoreNodes: false,
+    currentNodeCount: 0,
+    requiredNodeCount: 3,
+    generatedAt: null
+  },
+  similarPanelCollapsed: false,
+  similarPanelFlash: false,
+  expandedSimilarId: null,
+  similarSummaries: {},
+  loadingSummaryId: null
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -234,7 +247,123 @@ function renderTimeline() {
     ${isClosed ? renderReviewPanel() : ''}
     ${state.detailNode ? renderDetailCard() : ''}
     ${state.showAddNode ? renderAddNodeModal() : ''}
+    ${renderSimilarIncidentsPanel()}
   </div>`;
+}
+
+function renderSimilarIncidentsPanel() {
+  const si = state.similarIncidents;
+  const collapsed = state.similarPanelCollapsed;
+  const flashClass = state.similarPanelFlash ? 'flash' : '';
+
+  let content = '';
+  if (!collapsed) {
+    if (si.kbEmpty) {
+      content = `<div class="si-empty">暂无历史数据</div>`;
+    } else if (si.needsMoreNodes) {
+      content = `<div class="si-empty">积累 ${si.requiredNodeCount} 个节点后开始匹配 (当前 ${si.currentNodeCount}/${si.requiredNodeCount})</div>`;
+    } else if (si.matches.length === 0) {
+      content = `<div class="si-empty">暂无匹配的相似事故</div>`;
+    } else {
+      content = si.matches.map(m => {
+        const isExpanded = state.expandedSimilarId === m.incidentId;
+        const summary = state.similarSummaries[m.incidentId];
+        const loading = state.loadingSummaryId === m.incidentId;
+        const pct = Math.round(m.similarity * 100);
+
+        return `
+          <div class="si-item ${isExpanded ? 'expanded' : ''}">
+            <div class="si-item-header" data-action="toggle-similar-expand" data-id="${m.incidentId}">
+              <div class="si-item-title-row">
+                <span class="si-expand-arrow">${isExpanded ? '▼' : '▶'}</span>
+                <span class="si-item-title">${escapeHtml(m.title)}</span>
+              </div>
+              <div class="si-item-meta">
+                <span class="severity-badge severity-${m.severity}" style="padding:1px 6px;font-size:10px;">${m.severity}</span>
+                <span class="si-score" style="--pct:${pct}%;background-size:${pct}% 100%;"></span>
+                <span class="si-score-text">${pct}%</span>
+              </div>
+              <div class="si-item-services">
+                ${m.services.slice(0, 4).map(s => `<span class="si-service-tag">${escapeHtml(s)}</span>`).join('')}
+                ${m.services.length > 4 ? `<span class="si-more-tags">+${m.services.length - 4}</span>` : ''}
+              </div>
+            </div>
+            ${isExpanded ? `
+              <div class="si-item-detail">
+                <div class="si-detail-section">
+                  <div class="si-detail-label">相似度构成</div>
+                  <div class="si-score-breakdown">
+                    <div class="si-bd-item"><span>服务</span><span>${Math.round(m.serviceScore * 100)}%</span></div>
+                    <div class="si-bd-item"><span>来源类型</span><span>${Math.round(m.sourceScore * 100)}%</span></div>
+                    <div class="si-bd-item"><span>关键词</span><span>${Math.round(m.keywordScore * 100)}%</span></div>
+                  </div>
+                </div>
+                <div class="si-detail-section">
+                  <div class="si-detail-label">因果链摘要</div>
+                  ${loading ? `<div class="si-loading">加载中...</div>` : summary ? `
+                    <div class="si-causal-summary">
+                      <div class="si-structure-note">${summary.structureNote}</div>
+                      <div class="si-causal-chain">
+                        ${summary.causalSummary.map((cs, idx) => `
+                          <div class="si-chain-node">
+                            ${idx > 0 ? '<div class="si-chain-arrow">↓</div>' : ''}
+                            <div class="si-chain-content">
+                              <span class="src-badge src-${cs.sourceType}" style="margin-right:4px;">${SRC_LABELS[cs.sourceType] || cs.sourceType}</span>
+                              <span class="si-chain-svc">[${escapeHtml(cs.service)}]</span>
+                              <span class="si-chain-desc">${escapeHtml(cs.description)}</span>
+                            </div>
+                          </div>
+                        `).join('')}
+                      </div>
+                    </div>
+                  ` : ''}
+                </div>
+                <div class="si-detail-section">
+                  <div class="si-detail-label">根因描述</div>
+                  <div class="si-rootcause">
+                    ${summary?.rootCauseDesc ? escapeHtml(summary.rootCauseDesc) : (loading ? '加载中...' : '（未标注）')}
+                  </div>
+                </div>
+                <div class="si-marker-row">
+                  <div class="si-marker-counts">
+                    <span class="si-marker-helpful">👍 ${m.markers?.helpful || 0}</span>
+                    <span class="si-marker-irrelevant">👎 ${m.markers?.irrelevant || 0}</span>
+                  </div>
+                  <div class="si-marker-btns">
+                    <button class="btn btn-outline btn-sm" data-action="mark-similar" data-id="${m.incidentId}" data-type="helpful">👍 有帮助</button>
+                    <button class="btn btn-outline btn-sm" data-action="mark-similar" data-id="${m.incidentId}" data-type="irrelevant">👎 无关</button>
+                  </div>
+                </div>
+              </div>
+            ` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+  }
+
+  const countBadge = si.matches && si.matches.length > 0 && !collapsed ?
+    `<span class="si-count-badge">${si.matches.length}</span>` : '';
+
+  return `
+    <div class="similar-incidents-panel ${flashClass}" id="similar-panel">
+      <div class="si-header" data-action="toggle-similar-panel">
+        <span class="si-title">
+          ${collapsed ? '▶' : '▼'} 相似事故
+          ${countBadge}
+        </span>
+        ${si.generatedAt && !collapsed ? `<span class="si-gen-time">${formatTime(si.generatedAt)}</span>` : ''}
+      </div>
+      ${!collapsed ? `<div class="si-body">${content}</div>` : ''}
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
 }
 
 function renderDetailCard() {
@@ -741,6 +870,17 @@ function handleAction(e) {
     case 'show-review-form': state.showReviewForm = true; render(); break;
     case 'cancel-review': state.showReviewForm = false; render(); break;
     case 'submit-review': submitReview(); break;
+    case 'toggle-similar-panel':
+      state.similarPanelCollapsed = !state.similarPanelCollapsed;
+      state.similarPanelFlash = false;
+      render();
+      break;
+    case 'toggle-similar-expand':
+      toggleSimilarExpand(id);
+      break;
+    case 'mark-similar':
+      markSimilarRecommendation(id, e.currentTarget.dataset.type);
+      break;
   }
 }
 
@@ -779,6 +919,16 @@ async function openIncident(id) {
   const reviewRes = await fetch(`${API}/incidents/${id}/reviews`);
   state.currentReview = await reviewRes.json();
 
+  try {
+    const similarRes = await fetch(`${API}/incidents/${id}/similar`);
+    state.similarIncidents = await similarRes.json();
+  } catch (e) {
+    console.warn('load similar incidents failed:', e);
+  }
+  state.similarSummaries = {};
+  state.expandedSimilarId = null;
+  state.similarPanelFlash = false;
+
   state.view = 'timeline';
   state.detailNode = null;
   state.selectedNodeId = null;
@@ -787,6 +937,75 @@ async function openIncident(id) {
 
   connectWS(id);
   render();
+}
+
+function handleSimilarIncidentsPush(payload) {
+  const before = JSON.stringify(state.similarIncidents.matches.map(m => m.incidentId).sort());
+  state.similarIncidents = { ...state.similarIncidents, ...payload };
+  const after = JSON.stringify(payload.matches.map(m => m.incidentId).sort());
+  if (before !== after || payload.matches.length > 0) {
+    state.similarPanelFlash = true;
+    showToast('已为你推荐相似历史事故');
+    setTimeout(() => {
+      state.similarPanelFlash = false;
+      if (state.view === 'timeline') render();
+    }, 4000);
+  }
+  if (state.view === 'timeline') render();
+}
+
+function handleMarkerUpdate(payload) {
+  const matches = state.similarIncidents.matches || [];
+  const match = matches.find(m => m.incidentId === payload.recommendedIncidentId);
+  if (!match) return;
+  if (!match.markers) match.markers = { helpful: 0, irrelevant: 0 };
+  if (payload.markType === 'helpful') {
+    match.markers.helpful = Math.max(0, match.markers.helpful + 1);
+  } else if (payload.markType === 'irrelevant') {
+    match.markers.irrelevant = Math.max(0, match.markers.irrelevant + 1);
+  }
+  if (state.view === 'timeline') render();
+}
+
+async function toggleSimilarExpand(incidentId) {
+  if (state.expandedSimilarId === incidentId) {
+    state.expandedSimilarId = null;
+    render();
+    return;
+  }
+  state.expandedSimilarId = incidentId;
+  if (!state.similarSummaries[incidentId]) {
+    state.loadingSummaryId = incidentId;
+    render();
+    try {
+      const current = state.currentIncident;
+      const res = await fetch(`${API}/incidents/${current.id}/similar-summary/${incidentId}`);
+      state.similarSummaries[incidentId] = await res.json();
+    } catch (e) {
+      console.warn('load summary failed:', e);
+      state.similarSummaries[incidentId] = { causalSummary: [], structureNote: '加载失败', rootCauseDesc: null };
+    }
+    state.loadingSummaryId = null;
+  }
+  render();
+}
+
+async function markSimilarRecommendation(incidentId, markType) {
+  const current = state.currentIncident;
+  const userName = state.userName;
+  if (!userName) { showToast('请先设置姓名'); return; }
+  try {
+    const res = await fetch(`${API}/incidents/${current.id}/similar-marker`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recommendedIncidentId: incidentId, markType, userName })
+    });
+    if (res.ok) {
+      showToast(markType === 'helpful' ? '已标记为有帮助' : '已标记为无关');
+    }
+  } catch (e) {
+    console.warn('mark failed:', e);
+  }
 }
 
 function leaveIncident() {
@@ -1088,6 +1307,16 @@ function handleWSMessage(msg) {
       state.showReviewForm = false;
       refreshLogs();
       showToast('收到其他协作者提交的复盘评分');
+      render();
+      break;
+    case 'similar_incidents':
+      handleSimilarIncidentsPush(msg.payload);
+      break;
+    case 'recommendation_marker_updated':
+      handleMarkerUpdate(msg.payload);
+      break;
+    case 'incident_reopened':
+      refreshIncident();
       render();
       break;
   }

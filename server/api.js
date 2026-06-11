@@ -1,5 +1,8 @@
 const express = require('express');
 const { getDb, runQuery, runExec } = require('./db');
+const signatureEngine = require('./signatureEngine');
+
+const pendingMatching = new Set();
 
 function normalizeTime(t) {
   if (!t) return t;
@@ -37,9 +40,61 @@ function createApiRouter(wss) {
   }
 
   function isIncidentClosed(db, incidentId) {
-    const inc = runQuery(db, 'SELECT status FROM incidents WHERE id = ?', [incidentId])[0];
-    return inc && inc.status === 'closed';
+  const inc = runQuery(db, 'SELECT status FROM incidents WHERE id = ?', [incidentId])[0];
+  return inc && inc.status === 'closed';
+}
+
+function triggerAsyncMatching(db, wss, incidentId) {
+  const key = incidentId;
+  if (pendingMatching.has(key)) return;
+  pendingMatching.add(key);
+
+  const nodeCount = runQuery(db, `
+    SELECT COUNT(*) as c FROM timeline_nodes
+    WHERE incident_id = ? AND is_excluded = 0
+  `, [incidentId])[0].c;
+
+  if (nodeCount < 3) {
+    pendingMatching.delete(key);
+    return;
   }
+
+  setImmediate(() => {
+    try {
+      const startTs = Date.now();
+      const liveSig = signatureEngine.buildLiveSignature(db, incidentId);
+      const matches = signatureEngine.findSimilarIncidents(db, incidentId, liveSig);
+      const markers = runQuery(db, `
+        SELECT recommended_incident_id, mark_type, COUNT(*) as cnt
+        FROM recommendation_markers WHERE incident_id = ? GROUP BY recommended_incident_id, mark_type
+      `, [incidentId]);
+      const markerMap = {};
+      markers.forEach(m => {
+        if (!markerMap[m.recommended_incident_id]) {
+          markerMap[m.recommended_incident_id] = { helpful: 0, irrelevant: 0 };
+        }
+        markerMap[m.recommended_incident_id][m.mark_type] = m.cnt;
+      });
+      const result = {
+        incidentId,
+        matches: matches.map(m => ({
+          ...m,
+          markers: markerMap[m.incidentId] || { helpful: 0, irrelevant: 0 }
+        })),
+        generatedAt: new Date().toISOString()
+      };
+      const elapsed = Date.now() - startTs;
+      const delayBudget = Math.max(0, 2000 - elapsed);
+      setTimeout(() => {
+        broadcast(incidentId, { type: 'similar_incidents', payload: result });
+        pendingMatching.delete(key);
+      }, delayBudget);
+    } catch (e) {
+      console.error('async matching error:', e);
+      pendingMatching.delete(key);
+    }
+  });
+}
 
   function checkDuplicates(db, incidentId, nodeId) {
     const node = runQuery(db, 'SELECT occurred_at, service_name FROM timeline_nodes WHERE id = ?', [nodeId])[0];
@@ -137,9 +192,26 @@ function createApiRouter(wss) {
   router.put('/incidents/:id/close', (req, res) => {
     const db = req.db;
     runExec(db, "UPDATE incidents SET status = 'closed', updated_at = datetime('now') WHERE id = ?", [req.params.id]);
+    try {
+      signatureEngine.generateIncidentSignature(db, req.params.id);
+    } catch (e) {
+      console.error('signature generation error on close:', e);
+    }
     addLog(db, req.params.id, req.body.userName || 'system', 'close_incident', 'incident', req.params.id, null);
     broadcast(req.params.id, { type: 'incident_closed', incidentId: req.params.id });
     pushSync(db, req.params.id, 'incident_closed', { incidentId: req.params.id });
+    res.json({ ok: true });
+  });
+
+  router.put('/incidents/:id/reopen', (req, res) => {
+    const db = req.db;
+    const inc = runQuery(db, 'SELECT status FROM incidents WHERE id = ?', [req.params.id])[0];
+    if (!inc) return res.status(404).json({ error: 'not found' });
+    runExec(db, "UPDATE incidents SET status = 'open', updated_at = datetime('now') WHERE id = ?", [req.params.id]);
+    runExec(db, 'DELETE FROM incident_signatures WHERE incident_id = ?', [req.params.id]);
+    addLog(db, req.params.id, req.body.userName || 'system', 'reopen_incident', 'incident', req.params.id, null);
+    broadcast(req.params.id, { type: 'incident_reopened', incidentId: req.params.id });
+    pushSync(db, req.params.id, 'incident_reopened', { incidentId: req.params.id });
     res.json({ ok: true });
   });
 
@@ -196,6 +268,7 @@ function createApiRouter(wss) {
     addLog(db, req.params.incidentId, createdBy, 'add_node', 'node', id, description);
     broadcast(req.params.incidentId, { type: 'node_added', node });
     pushSync(db, req.params.incidentId, 'node_added', { node });
+    triggerAsyncMatching(db, wss, req.params.incidentId);
     res.status(201).json(node);
   });
 
@@ -228,6 +301,7 @@ function createApiRouter(wss) {
     addLog(db, req.params.incidentId, req.body.userName || 'unknown', 'update_node', 'node', req.params.nodeId, newDesc);
     broadcast(req.params.incidentId, { type: 'node_updated', node });
     pushSync(db, req.params.incidentId, 'node_updated', { node });
+    triggerAsyncMatching(db, wss, req.params.incidentId);
     res.json(node);
   });
 
@@ -560,6 +634,109 @@ function createApiRouter(wss) {
     });
     const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
     res.status(201).json(incident);
+  });
+
+  router.get('/incidents/:incidentId/similar', (req, res) => {
+    const db = req.db;
+    const incidentId = req.params.incidentId;
+    const nodeCount = runQuery(db, `
+      SELECT COUNT(*) as c FROM timeline_nodes
+      WHERE incident_id = ? AND is_excluded = 0
+    `, [incidentId])[0].c;
+
+    const sigCount = runQuery(db, `SELECT COUNT(*) as c FROM incident_signatures WHERE incident_id != ?`, [incidentId])[0].c;
+
+    if (sigCount === 0) {
+      return res.json({
+        incidentId,
+        matches: [],
+        kbEmpty: true,
+        generatedAt: new Date().toISOString()
+      });
+    }
+
+    if (nodeCount < 3) {
+      return res.json({
+        incidentId,
+        matches: [],
+        needsMoreNodes: true,
+        currentNodeCount: nodeCount,
+        requiredNodeCount: 3,
+        generatedAt: new Date().toISOString()
+      });
+    }
+
+    const liveSig = signatureEngine.buildLiveSignature(db, incidentId);
+    const matches = signatureEngine.findSimilarIncidents(db, incidentId, liveSig);
+    const markers = runQuery(db, `
+      SELECT recommended_incident_id, mark_type, COUNT(*) as cnt
+      FROM recommendation_markers WHERE incident_id = ? GROUP BY recommended_incident_id, mark_type
+    `, [incidentId]);
+    const markerMap = {};
+    markers.forEach(m => {
+      if (!markerMap[m.recommended_incident_id]) {
+        markerMap[m.recommended_incident_id] = { helpful: 0, irrelevant: 0 };
+      }
+      markerMap[m.recommended_incident_id][m.mark_type] = m.cnt;
+    });
+    res.json({
+      incidentId,
+      matches: matches.map(m => ({
+        ...m,
+        markers: markerMap[m.incidentId] || { helpful: 0, irrelevant: 0 }
+      })),
+      generatedAt: new Date().toISOString()
+    });
+  });
+
+  router.get('/incidents/:incidentId/similar-summary/:historicId', (req, res) => {
+    const db = req.db;
+    const summary = signatureEngine.getIncidentSummary(db, req.params.historicId);
+    const sig = runQuery(db, `SELECT root_cause_desc FROM incident_signatures WHERE incident_id = ?`, [req.params.historicId])[0];
+    res.json({
+      ...summary,
+      rootCauseDesc: sig ? sig.root_cause_desc : null
+    });
+  });
+
+  router.post('/incidents/:incidentId/similar-marker', (req, res) => {
+    const db = req.db;
+    const crypto = require('crypto');
+    const { recommendedIncidentId, markType, userName } = req.body;
+    if (!recommendedIncidentId || !markType || !userName) {
+      return res.status(400).json({ error: 'recommendedIncidentId, markType, userName required' });
+    }
+    if (!['helpful', 'irrelevant'].includes(markType)) {
+      return res.status(400).json({ error: 'markType must be helpful or irrelevant' });
+    }
+    const existing = runQuery(db, `
+      SELECT id, mark_type FROM recommendation_markers
+      WHERE incident_id = ? AND recommended_incident_id = ? AND marked_by = ?
+    `, [req.params.incidentId, recommendedIncidentId, userName]);
+
+    if (existing.length > 0) {
+      if (existing[0].mark_type === markType) {
+        runExec(db, `DELETE FROM recommendation_markers WHERE id = ?`, [existing[0].id]);
+      } else {
+        runExec(db, `UPDATE recommendation_markers SET mark_type = ?, created_at = datetime('now') WHERE id = ?`, [markType, existing[0].id]);
+      }
+    } else {
+      const id = crypto.randomUUID();
+      runExec(db, `
+        INSERT INTO recommendation_markers (id, incident_id, recommended_incident_id, marked_by, mark_type)
+        VALUES (?, ?, ?, ?, ?)
+      `, [id, req.params.incidentId, recommendedIncidentId, userName, markType]);
+    }
+    broadcast(req.params.incidentId, {
+      type: 'recommendation_marker_updated',
+      payload: {
+        incidentId: req.params.incidentId,
+        recommendedIncidentId,
+        userName,
+        markType
+      }
+    });
+    res.json({ ok: true });
   });
 
   return router;

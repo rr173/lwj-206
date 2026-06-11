@@ -1,5 +1,5 @@
 const { WebSocketServer } = require('ws');
-const { getDb } = require('./db');
+const { runQuery } = require('./db');
 
 function setupWebSocket(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -48,21 +48,27 @@ function setupWebSocket(server) {
     });
   }
 
+  wss.broadcast = broadcast;
+
   function sendMissedEvents(ws) {
     if (!ws.incidentId) return;
-    const db = getDb();
-    const events = db.prepare(
-      'SELECT * FROM sync_buffer WHERE incident_id = ? AND id > ? ORDER BY id ASC'
-    ).all(ws.incidentId, ws.lastSyncId);
-    if (events.length > 0) {
-      for (const ev of events) {
-        ws.send(JSON.stringify({
-          type: ev.event_type,
-          payload: JSON.parse(ev.payload),
-          syncId: ev.id
-        }));
+    try {
+      const events = runQuery(
+        'SELECT * FROM sync_buffer WHERE incident_id = ? AND id > ? ORDER BY id ASC',
+        [ws.incidentId, ws.lastSyncId]
+      );
+      if (events.length > 0) {
+        for (const ev of events) {
+          ws.send(JSON.stringify({
+            type: ev.event_type,
+            payload: JSON.parse(ev.payload),
+            syncId: ev.id
+          }));
+        }
+        ws.lastSyncId = events[events.length - 1].id;
       }
-      ws.lastSyncId = events[events.length - 1].id;
+    } catch (e) {
+      console.error('sendMissedEvents error:', e);
     }
   }
 

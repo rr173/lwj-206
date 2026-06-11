@@ -23,6 +23,8 @@ async function getDb() {
     } else {
       db = new SQL.Database();
     }
+    if (!globalThis.__timelineDb) globalThis.__timelineDb = {};
+    globalThis.__timelineDb.db = db;
     initSchema();
     seedDemoIfEmpty();
     saveDb();
@@ -161,6 +163,32 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS incident_signatures (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL UNIQUE,
+      services TEXT NOT NULL,
+      source_type_dist TEXT NOT NULL,
+      causal_depth INTEGER NOT NULL DEFAULT 0,
+      causal_width INTEGER NOT NULL DEFAULT 0,
+      time_span_seconds INTEGER NOT NULL DEFAULT 0,
+      keywords TEXT NOT NULL,
+      root_cause_desc TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS recommendation_markers (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL,
+      recommended_incident_id TEXT NOT NULL,
+      marked_by TEXT NOT NULL,
+      mark_type TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(incident_id, recommended_incident_id, marked_by)
+    );
+  `);
 }
 
 function rowToObject(row, columns) {
@@ -169,7 +197,18 @@ function rowToObject(row, columns) {
   return obj;
 }
 
-function runQuery(db, sql, params = []) {
+function runQuery(dbOrSql, sqlOrParams, maybeParams) {
+  let db, sql, params;
+  if (typeof dbOrSql === 'string') {
+    db = (globalThis.__timelineDb || { db: null }).db;
+    sql = dbOrSql;
+    params = sqlOrParams || [];
+  } else {
+    db = dbOrSql;
+    sql = sqlOrParams;
+    params = maybeParams || [];
+  }
+  if (!db) throw new Error('DB not initialized');
   const stmt = db.prepare(sql);
   stmt.bind(params);
   const result = { rows: [], columns: [] };
@@ -180,7 +219,18 @@ function runQuery(db, sql, params = []) {
   return result.rows;
 }
 
-function runExec(db, sql, params = []) {
+function runExec(dbOrSql, sqlOrParams, maybeParams) {
+  let db, sql, params;
+  if (typeof dbOrSql === 'string') {
+    db = (globalThis.__timelineDb || { db: null }).db;
+    sql = dbOrSql;
+    params = sqlOrParams || [];
+  } else {
+    db = dbOrSql;
+    sql = sqlOrParams;
+    params = maybeParams || [];
+  }
+  if (!db) throw new Error('DB not initialized');
   if (params.length === 0) {
     db.run(sql);
   } else {
