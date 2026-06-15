@@ -137,6 +137,16 @@ function safeDateToISO(ts) {
   }
 }
 
+function parseDbTime(raw) {
+  if (!raw) return Date.now();
+  if (typeof raw === 'number') return raw;
+  const s = String(raw).trim();
+  const isoLike = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s);
+  const ts = isoLike ? s.replace(' ', 'T') + 'Z' : s;
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? Date.now() : d.getTime();
+}
+
 function getIncidentSlaStatus(db, incident) {
   const rule = getRuleBySeverity(db, incident.severity);
   if (!rule) {
@@ -148,9 +158,7 @@ function getIncidentSlaStatus(db, incident) {
   violations.forEach(v => { violationMap[v.stage] = v; });
 
   const now = Date.now();
-  const createdRaw = incident.created_at || incident.start_time;
-  const createdDate = new Date(createdRaw);
-  const createdAt = isNaN(createdDate.getTime()) ? Date.now() : createdDate.getTime();
+  const createdAt = parseDbTime(incident.created_at || incident.start_time);
 
   const nodeCount = runQuery(db, `
     SELECT COUNT(*) as c FROM timeline_nodes
@@ -161,8 +169,7 @@ function getIncidentSlaStatus(db, incident) {
     SELECT MIN(created_at) as t FROM timeline_nodes
     WHERE incident_id = ? AND is_excluded = 0
   `, [incident.id])[0];
-  const firstNodeDate = firstNode && firstNode.t ? new Date(firstNode.t) : null;
-  const firstNodeAt = firstNodeDate && !isNaN(firstNodeDate.getTime()) ? firstNodeDate.getTime() : null;
+  const firstNodeAt = firstNode && firstNode.t ? parseDbTime(firstNode.t) : null;
 
   const linkCount = runQuery(db, `
     SELECT COUNT(*) as c FROM causal_links WHERE incident_id = ?
@@ -171,12 +178,10 @@ function getIncidentSlaStatus(db, incident) {
   const firstLink = runQuery(db, `
     SELECT MIN(created_at) as t FROM causal_links WHERE incident_id = ?
   `, [incident.id])[0];
-  const firstLinkDate = firstLink && firstLink.t ? new Date(firstLink.t) : null;
-  const firstLinkAt = firstLinkDate && !isNaN(firstLinkDate.getTime()) ? firstLinkDate.getTime() : null;
+  const firstLinkAt = firstLink && firstLink.t ? parseDbTime(firstLink.t) : null;
 
   const isClosed = incident.status === 'closed';
-  const closedDate = incident.end_time ? new Date(incident.end_time) : null;
-  const closedAt = (isClosed && closedDate && !isNaN(closedDate.getTime())) ? closedDate.getTime() : null;
+  const closedAt = isClosed && incident.end_time ? parseDbTime(incident.end_time) : null;
 
   function calcStage(stage, thresholdMin, achievedAt, stopAt) {
     const thresholdMs = thresholdMin * 60 * 1000;
@@ -253,7 +258,9 @@ function getIncidentSlaStatus(db, incident) {
 
   function getOverallStatus() {
     const s = stages;
-    if (s[STAGE_CLOSURE].status === 'violated' || incident.sla_violated) return 'violated';
+    const anyViolated = [STAGE_FIRST_RESPONSE, STAGE_ESCALATION, STAGE_CLOSURE]
+      .some(st => s[st].status === 'violated');
+    if (anyViolated || incident.sla_violated) return 'violated';
     const pendingStages = [s[STAGE_FIRST_RESPONSE], s[STAGE_ESCALATION], s[STAGE_CLOSURE]]
       .filter(st => st.status === 'pending' || st.status === 'pending_breach');
     if (pendingStages.length === 0) return 'normal';
@@ -290,7 +297,7 @@ function getIncidentSlaStatus(db, incident) {
     rule,
     stages,
     violations,
-    slaViolated: !!incident.sla_violated,
+    slaViolated: !!incident.sla_violated || violations.length > 0,
     overallStatus: getOverallStatus(),
     activeCountdown: getActiveCountdown(),
     firstResponseAchieved: nodeCount > 0,
@@ -352,22 +359,18 @@ function checkAndProcessIncident(db, uuidv4, wss, incident) {
 
   const now = new Date();
   const nowStr = now.toISOString();
-  const createdRaw = incident.created_at || incident.start_time;
-  const createdDate = new Date(createdRaw);
-  const createdAt = isNaN(createdDate.getTime()) ? Date.now() : createdDate.getTime();
+  const createdAt = parseDbTime(incident.created_at || incident.start_time);
 
   const firstNode = runQuery(db, `
     SELECT MIN(created_at) as t FROM timeline_nodes
     WHERE incident_id = ? AND is_excluded = 0
   `, [incident.id])[0];
-  const fnDate = firstNode && firstNode.t ? new Date(firstNode.t) : null;
-  const firstNodeAt = fnDate && !isNaN(fnDate.getTime()) ? fnDate.getTime() : null;
+  const firstNodeAt = firstNode && firstNode.t ? parseDbTime(firstNode.t) : null;
 
   const firstLink = runQuery(db, `
     SELECT MIN(created_at) as t FROM causal_links WHERE incident_id = ?
   `, [incident.id])[0];
-  const flDate = firstLink && firstLink.t ? new Date(firstLink.t) : null;
-  const firstLinkAt = flDate && !isNaN(flDate.getTime()) ? flDate.getTime() : null;
+  const firstLinkAt = firstLink && firstLink.t ? parseDbTime(firstLink.t) : null;
 
   let triggeredAny = false;
 
