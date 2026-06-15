@@ -402,23 +402,14 @@ function triggerAsyncMatching(db, wss, incidentId) {
       `, [req.params.incidentId]);
       const services = allNodes.map(n => n.service_name);
       dispatchOncallPersons(db, req.uuidv4, wss, req.params.incidentId, services, new Date());
+    }
 
-      const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
-      if (incident) {
-        try {
-          notificationEngine.notifySubscribersForNewIncident(db, req.uuidv4, wss, incident, services);
-        } catch (e) {
-          console.error('notify subscribers for new incident error:', e);
-        }
-      }
-    } else {
-      const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
-      if (incident) {
-        try {
-          notificationEngine.notifySubscribersForNewNode(db, req.uuidv4, wss, incident, node);
-        } catch (e) {
-          console.error('notify subscribers for new node error:', e);
-        }
+    const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
+    if (incident) {
+      try {
+        notificationEngine.notifySubscribersForNewNode(db, req.uuidv4, wss, incident, node);
+      } catch (e) {
+        console.error('notify subscribers for new node error:', e);
       }
     }
 
@@ -789,6 +780,15 @@ function triggerAsyncMatching(db, wss, incidentId) {
     if (tmplNodes.length > 0) {
       const services = [...new Set(tmplNodes.map(tn => tn.service_name))];
       dispatchOncallPersons(db, req.uuidv4, wss, id, services, new Date());
+
+      const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
+      if (incident) {
+        try {
+          notificationEngine.notifySubscribersForNewIncident(db, req.uuidv4, wss, incident, services);
+        } catch (e) {
+          console.error('notify subscribers for template incident error:', e);
+        }
+      }
     }
 
     const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];

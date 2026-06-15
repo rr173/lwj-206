@@ -152,6 +152,14 @@ function createNotification(db, uuidv4, userName, title, body, incidentId, servi
   return runQuery(db, 'SELECT * FROM notifications WHERE id = ?', [id])[0];
 }
 
+function hasUserReceivedNotificationForIncident(db, userName, incidentId) {
+  const result = runQuery(db, `
+    SELECT COUNT(*) as c FROM notifications
+    WHERE user_name = ? AND incident_id = ?
+  `, [userName, incidentId]);
+  return result[0].c > 0;
+}
+
 function notifySubscribersForNewIncident(db, uuidv4, wss, incident, services) {
   const uniqueServices = [...new Set(services)];
   const notifiedUsers = new Set();
@@ -162,6 +170,7 @@ function notifySubscribersForNewIncident(db, uuidv4, wss, incident, services) {
       const userName = sub.user_name;
       if (notifiedUsers.has(userName)) continue;
       if (userName === incident.owner_id) continue;
+      if (hasUserReceivedNotificationForIncident(db, userName, incident.id)) continue;
 
       notifiedUsers.add(userName);
 
@@ -193,6 +202,7 @@ function notifySubscribersForNewNode(db, uuidv4, wss, incident, node) {
     const userName = sub.user_name;
     if (incidentParticipants.includes(userName)) continue;
     if (userName === node.created_by) continue;
+    if (hasUserReceivedNotificationForIncident(db, userName, incident.id)) continue;
 
     const title = `事故更新：${node.description.substring(0, 30)}${node.description.length > 30 ? '...' : ''}`;
     const body = `事故「${incident.title}」有新的节点更新`;
@@ -234,5 +244,6 @@ module.exports = {
   createNotification,
   notifySubscribersForNewIncident,
   notifySubscribersForNewNode,
+  hasUserReceivedNotificationForIncident,
   getIncidentServices
 };
