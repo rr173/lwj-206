@@ -4,6 +4,7 @@ const signatureEngine = require('./signatureEngine');
 const serviceHealthEngine = require('./serviceHealthEngine');
 const oncallEngine = require('./oncallEngine');
 const slaEngine = require('./slaEngine');
+const notificationEngine = require('./notificationEngine');
 
 const pendingMatching = new Set();
 
@@ -275,6 +276,16 @@ function triggerAsyncMatching(db, wss, incidentId) {
     }
 
     const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [id])[0];
+
+    if (existingNodes.length > 0) {
+      const services = existingNodes.map(n => n.service_name);
+      try {
+        notificationEngine.notifySubscribersForNewIncident(db, req.uuidv4, wss, incident, services);
+      } catch (e) {
+        console.error('notify subscribers for new incident error:', e);
+      }
+    }
+
     res.status(201).json(incident);
   });
 
@@ -391,6 +402,24 @@ function triggerAsyncMatching(db, wss, incidentId) {
       `, [req.params.incidentId]);
       const services = allNodes.map(n => n.service_name);
       dispatchOncallPersons(db, req.uuidv4, wss, req.params.incidentId, services, new Date());
+
+      const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
+      if (incident) {
+        try {
+          notificationEngine.notifySubscribersForNewIncident(db, req.uuidv4, wss, incident, services);
+        } catch (e) {
+          console.error('notify subscribers for new incident error:', e);
+        }
+      }
+    } else {
+      const incident = runQuery(db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
+      if (incident) {
+        try {
+          notificationEngine.notifySubscribersForNewNode(db, req.uuidv4, wss, incident, node);
+        } catch (e) {
+          console.error('notify subscribers for new node error:', e);
+        }
+      }
     }
 
     res.status(201).json(node);
@@ -1185,6 +1214,113 @@ function triggerAsyncMatching(db, wss, incidentId) {
       res.json(violations);
     } catch (e) {
       console.error('get sla violations error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/subscriptions', (req, res) => {
+    try {
+      const { userName } = req.query;
+      if (!userName) return res.status(400).json({ error: 'userName required' });
+      const subscriptions = notificationEngine.getUserSubscriptions(req.db, userName);
+      res.json(subscriptions);
+    } catch (e) {
+      console.error('get subscriptions error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/subscriptions/services', (req, res) => {
+    try {
+      const services = notificationEngine.getAllServices(req.db);
+      res.json(services);
+    } catch (e) {
+      console.error('get all services error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.post('/subscriptions', (req, res) => {
+    try {
+      const { userName, serviceName } = req.body;
+      if (!userName || !serviceName) return res.status(400).json({ error: 'userName and serviceName required' });
+      const subscription = notificationEngine.addSubscription(req.db, req.uuidv4, userName, serviceName);
+      res.status(201).json(subscription);
+    } catch (e) {
+      console.error('add subscription error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.put('/subscriptions', (req, res) => {
+    try {
+      const { userName, serviceNames } = req.body;
+      if (!userName || !Array.isArray(serviceNames)) return res.status(400).json({ error: 'userName and serviceNames array required' });
+      const subscriptions = notificationEngine.updateSubscriptions(req.db, req.uuidv4, userName, serviceNames);
+      res.json(subscriptions);
+    } catch (e) {
+      console.error('update subscriptions error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.delete('/subscriptions', (req, res) => {
+    try {
+      const { userName, serviceName } = req.body;
+      if (!userName || !serviceName) return res.status(400).json({ error: 'userName and serviceName required' });
+      notificationEngine.removeSubscription(req.db, userName, serviceName);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('remove subscription error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/notifications', (req, res) => {
+    try {
+      const { userName, limit } = req.query;
+      if (!userName) return res.status(400).json({ error: 'userName required' });
+      const notifications = notificationEngine.getUserNotifications(req.db, userName, parseInt(limit) || 50);
+      res.json(notifications);
+    } catch (e) {
+      console.error('get notifications error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/notifications/unread-count', (req, res) => {
+    try {
+      const { userName } = req.query;
+      if (!userName) return res.status(400).json({ error: 'userName required' });
+      const count = notificationEngine.getUnreadCount(req.db, userName);
+      res.json({ unreadCount: count });
+    } catch (e) {
+      console.error('get unread count error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.put('/notifications/:id/read', (req, res) => {
+    try {
+      const { id } = req.params;
+      const { userName } = req.body;
+      if (!userName) return res.status(400).json({ error: 'userName required' });
+      notificationEngine.markNotificationRead(req.db, id, userName);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('mark notification read error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.put('/notifications/read-all', (req, res) => {
+    try {
+      const { userName } = req.body;
+      if (!userName) return res.status(400).json({ error: 'userName required' });
+      notificationEngine.markAllNotificationsRead(req.db, userName);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('mark all notifications read error:', e);
       res.status(500).json({ error: 'internal error' });
     }
   });

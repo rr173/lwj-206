@@ -22,6 +22,8 @@ function setupWebSocket(server) {
           });
         } else if (msg.type === 'sync_request') {
           sendMissedEvents(ws);
+        } else if (msg.type === 'subscribe_notifications') {
+          ws.userName = msg.userName;
         }
       } catch (e) {
         console.error('ws message error:', e);
@@ -49,6 +51,17 @@ function setupWebSocket(server) {
   }
 
   wss.broadcast = broadcast;
+
+  function broadcastToUser(userName, msg) {
+    const payload = JSON.stringify(msg);
+    wss.clients.forEach(client => {
+      if (client.readyState === 1 && client.userName === userName) {
+        client.send(payload);
+      }
+    });
+  }
+
+  wss.broadcastToUser = broadcastToUser;
 
   function sendMissedEvents(ws) {
     if (!ws.incidentId) return;

@@ -295,6 +295,27 @@ function initSchema() {
       UNIQUE(incident_id, stage)
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY,
+      user_name TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(user_name, service_name)
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      user_name TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      incident_id TEXT NOT NULL,
+      service_name TEXT NOT NULL,
+      is_read INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
   try {
     const colsResult = db.exec("PRAGMA table_info(incidents)");
     const cols = colsResult && colsResult.length > 0 ? colsResult[0].values.map(r => r[1]) : [];
@@ -497,6 +518,101 @@ function seedDemoIfEmpty() {
     seedDemoOncallData(db, uuidv4);
   } catch (e) {
     console.error('seed oncall demo data error:', e);
+  }
+
+  try {
+    seedDemoSubscriptionsAndNotifications(db, uuidv4);
+  } catch (e) {
+    console.error('seed subscriptions and notifications demo data error:', e);
+  }
+}
+
+function seedDemoSubscriptionsAndNotifications(db, uuidv4) {
+  const subCount = runQuery(db, 'SELECT COUNT(*) as c FROM subscriptions')[0].c;
+  if (subCount > 0) return;
+
+  const demoSubscriptions = [
+    { userName: 'alice', services: ['payment-gateway', 'order-service', 'auth-service'] },
+    { userName: 'bob', services: ['order-db', 'auth-redis', 'order-service'] },
+    { userName: 'carol', services: ['payment-gateway', 'order-db', 'auth-service', 'auth-redis'] }
+  ];
+
+  for (const sub of demoSubscriptions) {
+    for (const service of sub.services) {
+      runExec(db, `
+        INSERT INTO subscriptions (id, user_name, service_name)
+        VALUES (?, ?, ?)
+      `, [uuidv4(), sub.userName, service]);
+    }
+  }
+
+  const notifCount = runQuery(db, 'SELECT COUNT(*) as c FROM notifications')[0].c;
+  if (notifCount > 0) return;
+
+  const now = new Date();
+  const demoNotifications = [
+    {
+      userName: 'alice',
+      title: '新事故：支付服务大规模超时事故',
+      body: 'P1级事故已创建，涉及服务：payment-gateway',
+      incidentId: 'demo-incident-1',
+      serviceName: 'payment-gateway',
+      isRead: 0,
+      offsetMinutes: 120
+    },
+    {
+      userName: 'alice',
+      title: '事故更新：订单服务开始返回503错误',
+      body: '事故「支付服务大规模超时事故」有新的节点更新',
+      incidentId: 'demo-incident-1',
+      serviceName: 'order-service',
+      isRead: 0,
+      offsetMinutes: 110
+    },
+    {
+      userName: 'bob',
+      title: '新事故：数据库主从同步延迟导致读取旧数据',
+      body: 'P2级事故已创建，涉及服务：order-db',
+      incidentId: 'demo-incident-2',
+      serviceName: 'order-db',
+      isRead: 1,
+      offsetMinutes: 90
+    },
+    {
+      userName: 'carol',
+      title: '新事故：[演示] 用户登录服务P0级全面故障',
+      body: 'P0级事故已创建，涉及服务：auth-service',
+      incidentId: 'demo-incident-3',
+      serviceName: 'auth-service',
+      isRead: 1,
+      offsetMinutes: 60
+    },
+    {
+      userName: 'carol',
+      title: '事故更新：Redis认证集群连接数异常飙升',
+      body: '事故「用户登录服务P0级全面故障」有新的节点更新',
+      incidentId: 'demo-incident-3',
+      serviceName: 'auth-redis',
+      isRead: 1,
+      offsetMinutes: 45
+    }
+  ];
+
+  const incidents = runQuery(db, 'SELECT id, title FROM incidents ORDER BY created_at ASC');
+  const incidentMap = {};
+  incidents.forEach((inc, idx) => {
+    incidentMap[`demo-incident-${idx + 1}`] = inc;
+  });
+
+  for (const notif of demoNotifications) {
+    const incident = incidentMap[notif.incidentId];
+    if (!incident) continue;
+
+    const createdAt = new Date(now.getTime() - notif.offsetMinutes * 60 * 1000).toISOString();
+    runExec(db, `
+      INSERT INTO notifications (id, user_name, title, body, incident_id, service_name, is_read, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [uuidv4(), notif.userName, notif.title, notif.body, incident.id, notif.serviceName, notif.isRead, createdAt]);
   }
 }
 

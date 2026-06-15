@@ -15,6 +15,7 @@ let state = {
   onlineUsers: new Set(),
   userName: localStorage.getItem('tl_username') || '',
   ws: null,
+  notifyWs: null,
   lastSyncId: 0,
   selectedNodeId: null,
   connectionMode: false,
@@ -64,7 +65,12 @@ let state = {
   slaSortKey: null,
   slaSortAsc: true,
   currentSlaStatus: null,
-  slaCountdownTimer: null
+  slaCountdownTimer: null,
+  subscriptions: [],
+  allServices: [],
+  notifications: [],
+  unreadCount: 0,
+  showNotificationPanel: false
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -73,11 +79,11 @@ function $$(sel) { return document.querySelectorAll(sel); }
 function render() {
   const app = document.getElementById('app');
   if (state.view === 'list') {
-    app.innerHTML = renderIncidentList();
+    app.innerHTML = renderNotificationCenter() + renderIncidentList();
   } else if (state.view === 'stats') {
-    app.innerHTML = renderStatsPage();
+    app.innerHTML = renderNotificationCenter() + renderStatsPage();
   } else if (state.view === 'services') {
-    app.innerHTML = renderServicesPage();
+    app.innerHTML = renderNotificationCenter() + renderServicesPage();
     setTimeout(() => {
       renderServiceGraph();
       if (state.selectedServiceDetail) {
@@ -85,11 +91,13 @@ function render() {
       }
     }, 0);
   } else if (state.view === 'oncall') {
-    app.innerHTML = renderOncallPage();
+    app.innerHTML = renderNotificationCenter() + renderOncallPage();
   } else if (state.view === 'sla') {
-    app.innerHTML = renderSlaPage();
+    app.innerHTML = renderNotificationCenter() + renderSlaPage();
+  } else if (state.view === 'subscriptions') {
+    app.innerHTML = renderNotificationCenter() + renderSubscriptionsPage();
   } else {
-    app.innerHTML = renderTimeline();
+    app.innerHTML = renderNotificationCenter() + renderTimeline();
     renderTimelineGraphics();
     setTimeout(updateSlaCountdownDisplay, 0);
   }
@@ -164,6 +172,7 @@ function renderIncidentList() {
       <button class="btn btn-outline" data-action="go-services">🌐 服务健康度</button>
       <button class="btn btn-outline" data-action="go-oncall">📅 值班排班</button>
       <button class="btn btn-outline" data-action="go-sla">⏱ SLA规则</button>
+      <button class="btn btn-outline" data-action="go-subscriptions">🔔 订阅管理</button>
       <div style="flex:1"></div>
       <div style="display:flex;align-items:center;gap:8px;">
         <label style="font-size:12px;color:var(--text2);">SLA筛选:</label>
@@ -950,6 +959,20 @@ function bindEvents() {
       state.selectedNodeId = null;
     }
   });
+
+  const selectAllBtn = document.getElementById('sub-select-all');
+  if (selectAllBtn) {
+    selectAllBtn.onclick = () => {
+      document.querySelectorAll('.subscription-checkbox').forEach(cb => cb.checked = true);
+    };
+  }
+
+  const selectNoneBtn = document.getElementById('sub-select-none');
+  if (selectNoneBtn) {
+    selectNoneBtn.onclick = () => {
+      document.querySelectorAll('.subscription-checkbox').forEach(cb => cb.checked = false);
+    };
+  }
 }
 
 function handleAction(e) {
@@ -1039,6 +1062,24 @@ function handleAction(e) {
       break;
     case 'sort-incidents':
       setIncidentsSort(e.currentTarget.dataset.key);
+      break;
+    case 'go-subscriptions':
+      goSubscriptions();
+      break;
+    case 'toggle-notification-panel':
+      toggleNotificationPanel();
+      break;
+    case 'mark-notification-read':
+      markNotificationRead(e.currentTarget.dataset.id);
+      break;
+    case 'mark-all-notifications-read':
+      markAllNotificationsRead();
+      break;
+    case 'open-notification-incident':
+      openNotificationIncident(e.currentTarget.dataset.id, e.currentTarget.dataset.notifid);
+      break;
+    case 'save-subscriptions':
+      saveSubscriptions();
       break;
   }
 }
@@ -1516,6 +1557,9 @@ function handleWSMessage(msg) {
       break;
     case 'sla_breach':
       handleSlaBreachPush(msg);
+      break;
+    case 'new_notification':
+      handleNewNotificationPush(msg.notification);
       break;
   }
 }
@@ -2955,10 +2999,355 @@ async function saveSwap() {
   }
 }
 
+function renderNotificationCenter() {
+  const unreadCount = state.unreadCount;
+  const showPanel = state.showNotificationPanel;
+
+  let notificationsHtml = '';
+  if (showPanel) {
+    const notifs = state.notifications.slice(0, 50);
+    notificationsHtml = notifs.map(n => `
+      <div class="notification-item ${n.is_read ? 'notification-read' : 'notification-unread'}" 
+           data-action="open-notification-incident" 
+           data-id="${n.incident_id}" 
+           data-notifid="${n.id}">
+        <div class="notification-item-header">
+          <span class="notification-title">${escapeHtml(n.title)}</span>
+          ${!n.is_read ? `<span class="notification-unread-dot"></span>` : ''}
+        </div>
+        <div class="notification-item-body">${escapeHtml(n.body)}</div>
+        <div class="notification-item-footer">
+          <span class="notification-time">${formatNotificationTime(n.created_at)}</span>
+          <span class="notification-service">${escapeHtml(n.service_name)}</span>
+          ${!n.is_read ? `
+            <button class="btn btn-outline btn-xs notification-mark-read" 
+                    data-action="mark-notification-read" 
+                    data-id="${n.id}"
+                    onclick="event.stopPropagation();">标记已读</button>
+          ` : ''}
+        </div>
+      </div>
+    `).join('');
+
+    if (notifs.length === 0) {
+      notificationsHtml = '<div class="notification-empty">暂无通知</div>';
+    }
+  }
+
+  return `
+    <div class="notification-center">
+      <div class="notification-bell-container" data-action="toggle-notification-panel">
+        <span class="notification-bell">🔔</span>
+        ${unreadCount > 0 ? `<span class="notification-badge">${unreadCount > 99 ? '99+' : unreadCount}</span>` : ''}
+      </div>
+      ${showPanel ? `
+        <div class="notification-panel" onclick="event.stopPropagation()">
+          <div class="notification-panel-header">
+            <span>通知中心</span>
+            ${unreadCount > 0 ? `
+              <button class="btn btn-outline btn-xs" data-action="mark-all-notifications-read">全部已读</button>
+            ` : ''}
+          </div>
+          <div class="notification-panel-body">
+            ${notificationsHtml}
+          </div>
+          <div class="notification-panel-footer">
+            <span style="font-size:12px;color:var(--text2);">最近 50 条通知 · 最多保留 500 条</span>
+          </div>
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function formatNotificationTime(t) {
+  if (!t) return '';
+  const d = new Date(t);
+  const now = new Date();
+  const diff = now - d;
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes}分钟前`;
+  if (hours < 24) return `${hours}小时前`;
+  if (days < 7) return `${days}天前`;
+  return d.toLocaleDateString('zh-CN');
+}
+
+function renderSubscriptionsPage() {
+  const subscribedSet = new Set(state.subscriptions.map(s => s.service_name));
+  const services = state.allServices;
+  const maxSubs = 10;
+
+  const serviceItems = services.map(svc => `
+    <label class="subscription-item">
+      <input type="checkbox" 
+             class="subscription-checkbox" 
+             value="${escapeHtml(svc)}" 
+             ${subscribedSet.has(svc) ? 'checked' : ''}>
+      <span class="subscription-service-name">${escapeHtml(svc)}</span>
+    </label>
+  `).join('');
+
+  return `
+  <div class="subscriptions-page">
+    <header>
+      <h1>
+        <span style="cursor:pointer" data-action="go-back-list">←</span>
+        服务订阅管理
+      </h1>
+    </header>
+    <div class="subscriptions-content">
+      <div class="subscriptions-info-card">
+        <h3>📌 订阅说明</h3>
+        <ul style="margin:8px 0 0 20px;color:var(--text2);font-size:13px;line-height:1.8;">
+          <li>订阅后，当有新事故或事故节点更新涉及该服务时，您会收到通知</li>
+          <li>通知通过站内信和 WebSocket 实时推送</li>
+          <li>每个用户最多可以订阅 <b>${maxSubs}</b> 个服务</li>
+          <li>当前已订阅：<b>${state.subscriptions.length}/${maxSubs}</b> 个服务</li>
+        </ul>
+      </div>
+
+      <div class="subscriptions-username">
+        <label>当前用户名：</label>
+        <input id="sub-username" value="${state.userName}" placeholder="请输入用户名" style="flex:1;max-width:200px;">
+      </div>
+
+      <div class="subscriptions-list-header">
+        <h3>可订阅的服务</h3>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-outline btn-sm" id="sub-select-all">全选</button>
+          <button class="btn btn-outline btn-sm" id="sub-select-none">取消全选</button>
+        </div>
+      </div>
+
+      <div class="subscriptions-list">
+        ${serviceItems || '<div class="empty-state">暂无服务可订阅</div>'}
+      </div>
+
+      <div class="subscriptions-actions">
+        <button class="btn btn-primary" data-action="save-subscriptions">保存订阅</button>
+        <button class="btn btn-outline" data-action="go-back-list">取消</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function goSubscriptions() {
+  if (!state.userName) {
+    const name = prompt('请输入您的用户名：');
+    if (!name) return;
+    state.userName = name;
+    localStorage.setItem('tl_username', name);
+  }
+
+  state.view = 'subscriptions';
+  history.pushState({}, '', '/subscriptions');
+  await Promise.all([
+    loadSubscriptions(),
+    loadAllServices(),
+    loadNotifications(),
+    loadUnreadCount()
+  ]);
+  render();
+}
+
+async function loadSubscriptions() {
+  if (!state.userName) return;
+  try {
+    const res = await fetch(`${API}/subscriptions?userName=${encodeURIComponent(state.userName)}`);
+    state.subscriptions = await res.json();
+  } catch (e) {
+    console.error('load subscriptions error:', e);
+    state.subscriptions = [];
+  }
+}
+
+async function loadAllServices() {
+  try {
+    const res = await fetch(`${API}/subscriptions/services`);
+    state.allServices = await res.json();
+  } catch (e) {
+    console.error('load all services error:', e);
+    state.allServices = [];
+  }
+}
+
+async function loadNotifications() {
+  if (!state.userName) return;
+  try {
+    const res = await fetch(`${API}/notifications?userName=${encodeURIComponent(state.userName)}&limit=50`);
+    state.notifications = await res.json();
+  } catch (e) {
+    console.error('load notifications error:', e);
+    state.notifications = [];
+  }
+}
+
+async function loadUnreadCount() {
+  if (!state.userName) return;
+  try {
+    const res = await fetch(`${API}/notifications/unread-count?userName=${encodeURIComponent(state.userName)}`);
+    const data = await res.json();
+    state.unreadCount = data.unreadCount || 0;
+  } catch (e) {
+    console.error('load unread count error:', e);
+    state.unreadCount = 0;
+  }
+}
+
+function toggleNotificationPanel() {
+  state.showNotificationPanel = !state.showNotificationPanel;
+  if (state.showNotificationPanel) {
+    loadNotifications();
+  }
+  render();
+}
+
+async function markNotificationRead(notificationId) {
+  if (!state.userName) return;
+  try {
+    await fetch(`${API}/notifications/${notificationId}/read`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName: state.userName })
+    });
+    const notif = state.notifications.find(n => n.id === notificationId);
+    if (notif) notif.is_read = 1;
+    state.unreadCount = Math.max(0, state.unreadCount - 1);
+    render();
+  } catch (e) {
+    console.error('mark notification read error:', e);
+  }
+}
+
+async function markAllNotificationsRead() {
+  if (!state.userName) return;
+  try {
+    await fetch(`${API}/notifications/read-all`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName: state.userName })
+    });
+    state.notifications.forEach(n => n.is_read = 1);
+    state.unreadCount = 0;
+    render();
+  } catch (e) {
+    console.error('mark all notifications read error:', e);
+  }
+}
+
+async function openNotificationIncident(incidentId, notificationId) {
+  if (notificationId) {
+    const notif = state.notifications.find(n => n.id === notificationId);
+    if (notif && !notif.is_read) {
+      await markNotificationRead(notificationId);
+    }
+  }
+  state.showNotificationPanel = false;
+  openIncident(incidentId);
+}
+
+async function saveSubscriptions() {
+  const userName = document.getElementById('sub-username')?.value.trim();
+  if (!userName) {
+    showToast('请输入用户名');
+    return;
+  }
+  state.userName = userName;
+  localStorage.setItem('tl_username', userName);
+
+  const checkboxes = document.querySelectorAll('.subscription-checkbox:checked');
+  const serviceNames = Array.from(checkboxes).map(cb => cb.value);
+
+  try {
+    const res = await fetch(`${API}/subscriptions`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userName, serviceNames })
+    });
+
+    if (res.ok) {
+      state.subscriptions = await res.json();
+      showToast('订阅已保存');
+      connectNotifyWS();
+    } else {
+      const err = await res.json();
+      showToast(err.error || '保存失败');
+    }
+  } catch (e) {
+    console.error('save subscriptions error:', e);
+    showToast('保存失败');
+  }
+  render();
+}
+
+function handleNewNotificationPush(notification) {
+  if (!notification) return;
+
+  const existing = state.notifications.find(n => n.id === notification.id);
+  if (!existing) {
+    state.notifications.unshift(notification);
+    if (state.notifications.length > 50) {
+      state.notifications = state.notifications.slice(0, 50);
+    }
+  }
+
+  if (!notification.is_read) {
+    state.unreadCount += 1;
+    showToast(`🔔 新通知：${notification.title}`);
+  }
+
+  render();
+}
+
+function connectNotifyWS() {
+  if (!state.userName) return;
+
+  if (state.notifyWs) {
+    try { state.notifyWs.close(); } catch (e) {}
+    state.notifyWs = null;
+  }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  state.notifyWs = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ 
+      type: 'subscribe_notifications', 
+      userName: state.userName 
+    }));
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'new_notification') {
+        handleNewNotificationPush(msg.notification);
+      }
+    } catch (err) {
+      console.error('notify ws parse error', err);
+    }
+  };
+
+  ws.onclose = () => {
+    setTimeout(() => {
+      if (state.userName) {
+        connectNotifyWS();
+      }
+    }, 3000);
+  };
+}
+
 function handleRoute() {
   const path = window.location.pathname;
   if (path === '/oncall') {
     goOncall(false);
+  } else if (path === '/subscriptions') {
+    goSubscriptions();
   }
 }
 
@@ -2969,5 +3358,18 @@ function navigateTo(path) {
   handleRoute();
 }
 
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.notification-center') && state.showNotificationPanel) {
+    state.showNotificationPanel = false;
+    render();
+  }
+});
+
 loadIncidents();
 handleRoute();
+
+if (state.userName) {
+  loadUnreadCount();
+  loadNotifications();
+  connectNotifyWS();
+}
