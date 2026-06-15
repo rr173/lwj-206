@@ -55,7 +55,16 @@ let state = {
   showOncallPlanModal: false,
   editingPlanId: null,
   showSwapModal: false,
-  swapData: null
+  swapData: null,
+  slaRules: [],
+  slaEditingSeverity: null,
+  slaEditDraft: {},
+  slaStatuses: {},
+  slaFilter: 'all',
+  slaSortKey: null,
+  slaSortAsc: true,
+  currentSlaStatus: null,
+  slaCountdownTimer: null
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -77,38 +86,112 @@ function render() {
     }, 0);
   } else if (state.view === 'oncall') {
     app.innerHTML = renderOncallPage();
+  } else if (state.view === 'sla') {
+    app.innerHTML = renderSlaPage();
   } else {
     app.innerHTML = renderTimeline();
     renderTimelineGraphics();
+    setTimeout(updateSlaCountdownDisplay, 0);
   }
   bindEvents();
 }
 
 function renderIncidentList() {
-  const cards = state.incidents.map(i => `
-    <div class="incident-card" data-action="open-incident" data-id="${i.id}">
-      <h3>${i.title}</h3>
-      <div class="meta">
-        <span class="severity-badge severity-${i.severity}">${i.severity}</span>
-        <span class="status-tag ${i.status === 'open' ? 'status-open' : 'status-closed'}">${i.status === 'open' ? '进行中' : '已关闭'}</span>
-        <br>房间: ${i.room_code}<br>
-        ${i.start_time} ~ ${i.end_time || '未结束'}
-      </div>
-    </div>
+  let incidents = [...state.incidents];
+  if (state.slaFilter !== 'all') {
+    incidents = incidents.filter(i => {
+      const s = state.slaStatuses[i.id];
+      if (!s) return state.slaFilter === 'normal';
+      return s.overallStatus === state.slaFilter ||
+        (state.slaFilter === 'violated' && s.slaViolated) ||
+        (state.slaFilter === 'warning' && (s.overallStatus === 'warning' || s.overallStatus === 'caution'));
+    });
+  }
+  if (state.slaSortKey) {
+    incidents.sort((a, b) => {
+      let va, vb;
+      if (state.slaSortKey === 'sla') {
+        const order = { violated: 0, warning: 1, caution: 2, normal: 3 };
+        va = order[(state.slaStatuses[a.id] || {}).overallStatus] ?? 99;
+        vb = order[(state.slaStatuses[b.id] || {}).overallStatus] ?? 99;
+        if ((state.slaStatuses[a.id] || {}).slaViolated) va = -1;
+        if ((state.slaStatuses[b.id] || {}).slaViolated) vb = -1;
+      } else if (state.slaSortKey === 'severity') {
+        const order = { P0: 0, P1: 1, P2: 2, P3: 3 };
+        va = order[a.severity] ?? 99;
+        vb = order[b.severity] ?? 99;
+      } else if (state.slaSortKey === 'created') {
+        va = new Date(a.created_at || a.start_time).getTime();
+        vb = new Date(b.created_at || b.start_time).getTime();
+      }
+      return state.slaSortAsc ? va - vb : vb - va;
+    });
+  }
+
+  function slaBadge(incidentId) {
+    const s = state.slaStatuses[incidentId];
+    if (!s) return '<span class="sla-badge sla-normal">正常</span>';
+    if (s.slaViolated) return '<span class="sla-badge sla-violated" title="SLA已违规">⚠ 已违规</span>';
+    if (s.overallStatus === 'warning') return '<span class="sla-badge sla-warning">即将超时</span>';
+    if (s.overallStatus === 'caution') return '<span class="sla-badge sla-caution">注意</span>';
+    return '<span class="sla-badge sla-normal">正常</span>';
+  }
+
+  const rows = incidents.map(i => `
+    <tr class="incident-row" data-action="open-incident" data-id="${i.id}">
+      <td>
+        ${i.sla_violated ? '<span class="sla-warn-icon" title="SLA已违规">⚠️</span>' : ''}
+        ${escapeHtml(i.title)}
+      </td>
+      <td><span class="severity-badge severity-${i.severity}">${i.severity}</span></td>
+      <td><span class="status-tag ${i.status === 'open' ? 'status-open' : 'status-closed'}">${i.status === 'open' ? '进行中' : '已关闭'}</span></td>
+      <td>${slaBadge(i.id)}</td>
+      <td style="font-family:monospace;font-size:12px;">${i.room_code}</td>
+      <td style="font-size:12px;color:var(--text2);">${(i.start_time || '').slice(0, 16)}<br>${i.end_time ? (i.end_time.slice(0, 16)) : '未结束'}</td>
+    </tr>
   `).join('');
+
+  const sortArrow = (key) => state.slaSortKey === key ? (state.slaSortAsc ? ' ↑' : ' ↓') : '';
 
   return `
   <div class="incident-list">
     <h1>故障时间线还原工具</h1>
     <p style="color:var(--text2);margin-bottom:8px;">选择一个事故进入协作房间，或创建新事故</p>
-    <div style="margin-bottom:16px;display:flex;gap:8px;">
+    <div style="margin-bottom:16px;display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-primary" data-action="create-incident">+ 创建事故</button>
       <button class="btn btn-outline" data-action="show-template-list">📋 模板管理</button>
       <button class="btn btn-outline" data-action="go-stats">📊 评分统计</button>
       <button class="btn btn-outline" data-action="go-services">🌐 服务健康度</button>
       <button class="btn btn-outline" data-action="go-oncall">📅 值班排班</button>
+      <button class="btn btn-outline" data-action="go-sla">⏱ SLA规则</button>
+      <div style="flex:1"></div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <label style="font-size:12px;color:var(--text2);">SLA筛选:</label>
+        <select id="sla-filter" style="background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 8px;">
+          <option value="all" ${state.slaFilter === 'all' ? 'selected' : ''}>全部</option>
+          <option value="normal" ${state.slaFilter === 'normal' ? 'selected' : ''}>正常</option>
+          <option value="warning" ${state.slaFilter === 'warning' ? 'selected' : ''}>即将超时/注意</option>
+          <option value="violated" ${state.slaFilter === 'violated' ? 'selected' : ''}>已违规</option>
+        </select>
+      </div>
     </div>
-    <div class="incident-cards">${cards || '<div class="empty-state">暂无事故记录</div>'}</div>
+    <div class="incident-table-wrap">
+      <table class="incident-table">
+        <thead>
+          <tr>
+            <th style="cursor:pointer;" data-action="sort-incidents" data-key="created">事故标题${sortArrow('created')}</th>
+            <th style="cursor:pointer;" data-action="sort-incidents" data-key="severity">等级${sortArrow('severity')}</th>
+            <th>状态</th>
+            <th style="cursor:pointer;" data-action="sort-incidents" data-key="sla">SLA状态${sortArrow('sla')}</th>
+            <th>房间号</th>
+            <th>时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--text2);">暂无事故记录</td></tr>'}
+        </tbody>
+      </table>
+    </div>
     ${state.showCreateIncident ? renderCreateIncidentModal() : ''}
     ${state.showTemplateList ? renderTemplateListModal() : ''}
   </div>`;
@@ -176,12 +259,16 @@ function renderTimeline() {
 
   const isClosed = inc.status === 'closed';
 
+  const slaWarnIcon = inc.sla_violated ? '<span class="sla-title-warn" title="SLA已违规">⚠️</span>' : '';
+
   return `
   <div id="app" style="display:flex;flex-direction:column;height:100vh;">
+    ${renderSlaCountdownBar()}
     <header>
       <h1>
         <span style="cursor:pointer" data-action="go-back">←</span>
-        ${inc.title}
+        ${slaWarnIcon}
+        ${escapeHtml(inc.title)}
         <span class="severity-badge severity-${inc.severity}">${inc.severity}</span>
         <span class="status-tag ${isClosed ? 'status-closed' : 'status-open'}">${isClosed ? '已关闭(只读)' : '进行中'}</span>
       </h1>
@@ -776,6 +863,14 @@ function bindEvents() {
     el.onclick = handleAction;
   });
 
+  const slaFilterEl = document.getElementById('sla-filter');
+  if (slaFilterEl) {
+    slaFilterEl.onchange = (e) => {
+      state.slaFilter = e.target.value;
+      render();
+    };
+  }
+
   document.querySelectorAll('.star-btn').forEach(el => {
     el.onclick = (e) => {
       e.stopPropagation();
@@ -929,6 +1024,22 @@ function handleAction(e) {
     case 'open-service-incident':
       openIncidentFromService(e.currentTarget.dataset.id);
       break;
+    case 'go-sla':
+      goSla();
+      break;
+    case 'sla-edit':
+      startSlaEdit(e.currentTarget.dataset.severity);
+      break;
+    case 'sla-cancel-edit':
+      state.slaEditingSeverity = null;
+      render();
+      break;
+    case 'sla-save':
+      saveSlaRule(e.currentTarget.dataset.severity);
+      break;
+    case 'sort-incidents':
+      setIncidentsSort(e.currentTarget.dataset.key);
+      break;
   }
 }
 
@@ -938,13 +1049,16 @@ async function openIncident(id) {
   state.userName = userName;
   localStorage.setItem('tl_username', userName);
 
-  const [incRes, nodesRes, linksRes, dupsRes, partsRes, logsRes] = await Promise.all([
+  stopSlaCountdownTimer();
+
+  const [incRes, nodesRes, linksRes, dupsRes, partsRes, logsRes, slaRes] = await Promise.all([
     fetch(`${API}/incidents/${id}`),
     fetch(`${API}/incidents/${id}/nodes`),
     fetch(`${API}/incidents/${id}/causal-links`),
     fetch(`${API}/incidents/${id}/duplicates`),
     fetch(`${API}/incidents/${id}/participants`),
     fetch(`${API}/incidents/${id}/logs`),
+    fetch(`${API}/sla/incidents/${id}/status`),
   ]);
 
   state.currentIncident = await incRes.json();
@@ -953,6 +1067,13 @@ async function openIncident(id) {
   state.duplicates = await dupsRes.json();
   state.participants = await partsRes.json();
   state.logs = await logsRes.json();
+  try {
+    const slaStatus = await slaRes.json();
+    slaStatus._lastFetched = Date.now();
+    state.currentSlaStatus = slaStatus;
+  } catch (e) {
+    state.currentSlaStatus = null;
+  }
 
   await fetch(`${API}/incidents/${id}/join`, {
     method: 'POST',
@@ -984,7 +1105,31 @@ async function openIncident(id) {
   state.showReviewForm = false;
 
   connectWS(id);
+  startSlaCountdownTimer();
   render();
+}
+
+async function refreshCurrentSlaStatus() {
+  if (!state.currentIncident) return;
+  try {
+    const res = await fetch(`${API}/sla/incidents/${state.currentIncident.id}/status`);
+    const slaStatus = await res.json();
+    slaStatus._lastFetched = Date.now();
+    state.currentSlaStatus = slaStatus;
+    if (state.currentIncident) {
+      state.currentIncident.sla_violated = slaStatus.slaViolated ? 1 : 0;
+    }
+  } catch (e) {}
+}
+
+function handleSlaBreachPush(payload) {
+  showToast(`⚠️ SLA 超时：${payload.stageLabel}（${payload.thresholdMinutes}分钟）`);
+  if (payload.markedViolated && state.currentIncident) {
+    state.currentIncident.sla_violated = 1;
+  }
+  refreshCurrentSlaStatus();
+  refreshLogs();
+  if (state.view === 'timeline') render();
 }
 
 function handleSimilarIncidentsPush(payload) {
@@ -1058,8 +1203,10 @@ async function markSimilarRecommendation(incidentId, markType) {
 
 function leaveIncident() {
   if (state.ws) { state.ws.close(); state.ws = null; }
+  stopSlaCountdownTimer();
   state.view = 'list';
   state.currentIncident = null;
+  state.currentSlaStatus = null;
   state.nodes = [];
   state.causalLinks = [];
   state.duplicates = [];
@@ -1367,6 +1514,9 @@ function handleWSMessage(msg) {
       refreshIncident();
       render();
       break;
+    case 'sla_breach':
+      handleSlaBreachPush(msg);
+      break;
   }
 }
 
@@ -1375,6 +1525,86 @@ async function loadIncidents() {
   state.incidents = await res.json();
   const tmplRes = await fetch(`${API}/templates`);
   state.templates = await tmplRes.json();
+  try {
+    const slaRes = await fetch(`${API}/sla/incidents/batch`);
+    const slaStatuses = await slaRes.json();
+    state.slaStatuses = {};
+    for (const s of slaStatuses) {
+      state.slaStatuses[s.incidentId] = s;
+    }
+  } catch (e) {
+    state.slaStatuses = {};
+  }
+  render();
+}
+
+async function goSla() {
+  state.view = 'sla';
+  state.slaEditingSeverity = null;
+  try {
+    const res = await fetch(`${API}/sla/rules`);
+    state.slaRules = await res.json();
+  } catch (e) {
+    state.slaRules = [];
+  }
+  render();
+}
+
+function startSlaEdit(severity) {
+  const rule = state.slaRules.find(r => r.severity === severity);
+  if (!rule) return;
+  state.slaEditingSeverity = severity;
+  state.slaEditDraft[severity] = {
+    firstResponseMinutes: rule.first_response_minutes,
+    escalationMinutes: rule.escalation_minutes,
+    closureMinutes: rule.closure_minutes
+  };
+  render();
+}
+
+async function saveSlaRule(severity) {
+  const frEl = document.getElementById(`sla-in-fr-${severity}`);
+  const esEl = document.getElementById(`sla-in-es-${severity}`);
+  const clEl = document.getElementById(`sla-in-cl-${severity}`);
+  if (!frEl || !esEl || !clEl) return;
+
+  const body = {
+    firstResponseMinutes: parseInt(frEl.value),
+    escalationMinutes: parseInt(esEl.value),
+    closureMinutes: parseInt(clEl.value)
+  };
+  if ([body.firstResponseMinutes, body.escalationMinutes, body.closureMinutes].some(v => !v || v <= 0)) {
+    showToast('时限必须是正整数');
+    return;
+  }
+  try {
+    const res = await fetch(`${API}/sla/rules/${severity}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (res.ok) {
+      state.slaEditingSeverity = null;
+      const rulesRes = await fetch(`${API}/sla/rules`);
+      state.slaRules = await rulesRes.json();
+      showToast('SLA规则已更新');
+    } else {
+      const err = await res.json();
+      showToast(err.error || '保存失败');
+    }
+  } catch (e) {
+    showToast('保存失败');
+  }
+  render();
+}
+
+function setIncidentsSort(key) {
+  if (state.slaSortKey === key) {
+    state.slaSortAsc = !state.slaSortAsc;
+  } else {
+    state.slaSortKey = key;
+    state.slaSortAsc = true;
+  }
   render();
 }
 
@@ -1564,6 +1794,165 @@ function stringToColor(s) {
   return `hsl(${h}, 65%, 50%)`;
 }
 
+function formatDurationMs(ms) {
+  if (ms <= 0) return '0:00';
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
+  return `${m}:${pad(s)}`;
+}
+
+function getCountdownColorClass(remainingMs, thresholdMin) {
+  if (remainingMs <= 0) return 'sla-countdown-breach';
+  const pct = remainingMs / (thresholdMin * 60 * 1000);
+  if (pct < 0.2) return 'sla-countdown-red';
+  if (pct < 0.5) return 'sla-countdown-yellow';
+  return 'sla-countdown-green';
+}
+
+function renderSlaCountdownBar() {
+  const sla = state.currentSlaStatus;
+  if (!sla || sla.slaViolated) {
+    if (sla?.slaViolated) {
+      return `<div class="sla-countdown-bar sla-countdown-violated-static">
+        <div class="sla-countdown-inner">
+          <span class="sla-countdown-label">⚠️ SLA 已违规</span>
+          <span class="sla-countdown-time">关闭时限已超出</span>
+        </div>
+      </div>`;
+    }
+    return '<div class="sla-countdown-bar sla-countdown-hidden"></div>';
+  }
+
+  const active = sla.activeCountdown;
+  if (!active) {
+    return '<div class="sla-countdown-bar sla-countdown-hidden"></div>';
+  }
+
+  const colorClass = getCountdownColorClass(active.remainingMs, active.thresholdMinutes);
+  const isBreaching = active.isBreaching || active.remainingMs <= 0;
+
+  return `<div class="sla-countdown-bar sla-countdown-active ${colorClass} ${isBreaching ? 'sla-blink' : ''}" id="sla-countdown-bar">
+    <div class="sla-countdown-inner">
+      <span class="sla-countdown-label">⏱ ${active.label} 剩余</span>
+      <span class="sla-countdown-time" id="sla-countdown-time">${formatDurationMs(active.remainingMs)}</span>
+      <span class="sla-countdown-threshold">(时限 ${active.thresholdMinutes}分钟)</span>
+    </div>
+  </div>`;
+}
+
+function updateSlaCountdownDisplay() {
+  const sla = state.currentSlaStatus;
+  if (!sla) return;
+  const active = sla.activeCountdown;
+  if (!active) return;
+
+  const bar = document.getElementById('sla-countdown-bar');
+  const timeEl = document.getElementById('sla-countdown-time');
+  if (!bar || !timeEl) return;
+
+  const elapsed = Date.now() - (sla._lastFetched || Date.now());
+  const remaining = Math.max(0, active.remainingMs - elapsed);
+  timeEl.textContent = formatDurationMs(remaining);
+
+  const colorClass = getCountdownColorClass(remaining, active.thresholdMinutes);
+  bar.className = 'sla-countdown-bar sla-countdown-active ' + colorClass +
+    ((active.isBreaching || remaining <= 0) ? ' sla-blink' : '');
+}
+
+function startSlaCountdownTimer() {
+  stopSlaCountdownTimer();
+  state.slaCountdownTimer = setInterval(() => {
+    if (state.view !== 'timeline') return;
+    updateSlaCountdownDisplay();
+  }, 1000);
+}
+
+function stopSlaCountdownTimer() {
+  if (state.slaCountdownTimer) {
+    clearInterval(state.slaCountdownTimer);
+    state.slaCountdownTimer = null;
+  }
+}
+
+function renderSlaPage() {
+  const rules = state.slaRules || [];
+  const rows = rules.map(r => {
+    const isEditing = state.slaEditingSeverity === r.severity;
+    if (isEditing) {
+      const draft = state.slaEditDraft[r.severity] || {
+        firstResponseMinutes: r.first_response_minutes,
+        escalationMinutes: r.escalation_minutes,
+        closureMinutes: r.closure_minutes
+      };
+      return `
+        <tr class="sla-row-editing">
+          <td><span class="severity-badge severity-${r.severity}">${r.severity}</span></td>
+          <td><input type="number" min="1" class="sla-input" id="sla-in-fr-${r.severity}" value="${draft.firstResponseMinutes}"></td>
+          <td><input type="number" min="1" class="sla-input" id="sla-in-es-${r.severity}" value="${draft.escalationMinutes}"></td>
+          <td><input type="number" min="1" class="sla-input" id="sla-in-cl-${r.severity}" value="${draft.closureMinutes}"></td>
+          <td>
+            <button class="btn btn-primary btn-sm" data-action="sla-save" data-severity="${r.severity}">保存</button>
+            <button class="btn btn-outline btn-sm" data-action="sla-cancel-edit">取消</button>
+          </td>
+        </tr>`;
+    }
+    return `
+      <tr>
+        <td><span class="severity-badge severity-${r.severity}">${r.severity}</span></td>
+        <td>${r.first_response_minutes} 分钟</td>
+        <td>${r.escalation_minutes} 分钟</td>
+        <td>${r.closure_minutes} 分钟</td>
+        <td>
+          <button class="btn btn-outline btn-sm" data-action="sla-edit" data-severity="${r.severity}">编辑</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  return `
+  <div class="sla-page">
+    <header>
+      <h1>
+        <span style="cursor:pointer" data-action="go-back-list">←</span>
+        SLA 规则配置
+      </h1>
+    </header>
+    <div class="sla-content">
+      <div class="sla-info-card">
+        <h3>📌 SLA 规则说明</h3>
+        <ul style="margin:8px 0 0 20px;color:var(--text2);font-size:13px;line-height:1.8;">
+          <li><b>首次响应时限</b>：从事故创建到添加第一个事件节点的允许时间（分钟），超时自动拉入备班人员</li>
+          <li><b>阶段升级时限</b>：从事故创建到画出第一条因果链的允许时间（分钟），超时自动拉入值班计划负责人</li>
+          <li><b>关闭时限</b>：从事故创建到事故关闭的允许时间（分钟），超时标记事故为 SLA 违规</li>
+          <li>后端每 30 秒扫描一次，同一阶段超时只触发一次升级</li>
+        </ul>
+      </div>
+      <div class="sla-table-wrap">
+        <table class="sla-table">
+          <thead>
+            <tr>
+              <th>严重等级</th>
+              <th>首次响应时限</th>
+              <th>阶段升级时限</th>
+              <th>关闭时限</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || '<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--text2);">暂无规则，请刷新页面</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top:16px;color:var(--text2);font-size:12px;">
+        * P0-P3 四条规则为内置不可删除，修改后立即对所有未关闭事故生效
+      </div>
+    </div>
+  </div>`;
+}
+
 function formatLogAction(l) {
   const map = {
     add_node: '添加了事件节点',
@@ -1577,7 +1966,19 @@ function formatLogAction(l) {
     join: '加入了协作房间',
     close_incident: '关闭了事故',
     submit_review: '提交了复盘评分',
+    sla_breach: '触发了 SLA 超时',
+    sla_upgrade_backup: 'SLA 自动升级：拉入备班人员',
+    sla_upgrade_owner: 'SLA 自动升级：拉入值班负责人',
+    sla_violated_mark: '标记事故为 SLA 违规',
+    auto_dispatch: '自动派发值班人员',
+    auto_upgrade: '自动升级：拉入备班人员'
   };
+  if (l.action === 'sla_breach' && l.detail) {
+    try {
+      const d = JSON.parse(l.detail);
+      return `触发 SLA 超时：${d.stageLabel} (${d.thresholdMinutes}分钟)`;
+    } catch (e) {}
+  }
   return map[l.action] || l.action;
 }
 

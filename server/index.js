@@ -6,6 +6,7 @@ const createApiRouter = require('./api');
 const { getDb, runQuery, runExec } = require('./db');
 const serviceHealthEngine = require('./serviceHealthEngine');
 const oncallEngine = require('./oncallEngine');
+const slaEngine = require('./slaEngine');
 
 const app = express();
 const server = http.createServer(app);
@@ -34,6 +35,12 @@ getDb().then(({ db, uuidv4 }) => {
     console.error('seed oncall data error:', e);
   }
 
+  try {
+    slaEngine.scanAndCheckSla(db, uuidv4, wss);
+  } catch (e) {
+    console.error('initial sla scan error:', e);
+  }
+
   setInterval(() => {
     try {
       oncallEngine.checkAndUpgradeIncidents(db, uuidv4, wss);
@@ -41,6 +48,14 @@ getDb().then(({ db, uuidv4 }) => {
       console.error('check and upgrade incidents error:', e);
     }
   }, 60 * 1000);
+
+  setInterval(() => {
+    try {
+      slaEngine.scanAndCheckSla(db, uuidv4, wss);
+    } catch (e) {
+      console.error('sla scan error:', e);
+    }
+  }, 30 * 1000);
 });
 
 server.listen(PORT, () => {

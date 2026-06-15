@@ -273,6 +273,37 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sla_rules (
+      id TEXT PRIMARY KEY,
+      severity TEXT NOT NULL UNIQUE,
+      first_response_minutes INTEGER NOT NULL,
+      escalation_minutes INTEGER NOT NULL,
+      closure_minutes INTEGER NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sla_violations (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      threshold_minutes INTEGER NOT NULL,
+      breached_at TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(incident_id, stage)
+    );
+  `);
+  try {
+    const colsResult = db.exec("PRAGMA table_info(incidents)");
+    const cols = colsResult && colsResult.length > 0 ? colsResult[0].values.map(r => r[1]) : [];
+    if (!cols.includes('sla_violated')) {
+      db.run(`ALTER TABLE incidents ADD COLUMN sla_violated INTEGER NOT NULL DEFAULT 0`);
+    }
+  } catch (e) {
+    console.warn('check sla_violated column skipped:', e.message);
+  }
 }
 
 function rowToObject(row, columns) {
@@ -326,8 +357,26 @@ function runExec(dbOrSql, sqlOrParams, maybeParams) {
   saveDb();
 }
 
+function seedDefaultSlaRules() {
+  const existing = runQuery(db, 'SELECT COUNT(*) as c FROM sla_rules')[0].c;
+  if (existing > 0) return;
+  const defaults = [
+    { severity: 'P0', firstResponse: 5, escalation: 30, closure: 120 },
+    { severity: 'P1', firstResponse: 10, escalation: 60, closure: 240 },
+    { severity: 'P2', firstResponse: 30, escalation: 120, closure: 480 },
+    { severity: 'P3', firstResponse: 60, escalation: 240, closure: 1440 }
+  ];
+  for (const r of defaults) {
+    runExec(db, `
+      INSERT INTO sla_rules (id, severity, first_response_minutes, escalation_minutes, closure_minutes)
+      VALUES (?, ?, ?, ?, ?)
+    `, [uuidv4(), r.severity, r.firstResponse, r.escalation, r.closure]);
+  }
+}
+
 function seedDemoIfEmpty() {
   const { seedDemoOncallData } = require('./oncallEngine');
+  seedDefaultSlaRules();
   const count = runQuery(db, 'SELECT COUNT(*) as c FROM incidents')[0].c;
   if (count > 0) {
     try {
@@ -413,6 +462,36 @@ function seedDemoIfEmpty() {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [n.id, incident2Id, n.time, n.desc, n.src, n.svc, n.by, i]);
   });
+
+  const incident3Id = uuidv4();
+  const roomCode3 = 'DEMO-P0-SLA';
+  const now = new Date();
+  const createdTime = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+  const createdStr = createdTime.toISOString();
+  const startTimeStr = createdTime.toISOString();
+
+  runExec(db, `
+    INSERT INTO incidents (id, title, severity, start_time, end_time, status, owner_id, room_code, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [incident3Id, '[演示] 用户登录服务P0级全面故障（SLA违规演示）', 'P0', startTimeStr, null, 'open', 'alice', roomCode3, createdStr]);
+
+  runExec(db, `INSERT INTO participants (id, incident_id, user_name, role) VALUES (?, ?, ?, 'owner')`,
+    [uuidv4(), incident3Id, 'alice']);
+  runExec(db, `INSERT INTO participants (id, incident_id, user_name, role) VALUES (?, ?, ?, 'member')`,
+    [uuidv4(), incident3Id, 'bob']);
+
+  const node3_1 = uuidv4();
+  runExec(db, `
+    INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [node3_1, incident3Id, startTimeStr, '全国各地用户反馈无法登录，错误率100%', 'monitor', 'auth-service', 'alice', 0]);
+
+  const node3_2 = uuidv4();
+  runExec(db, `
+    INSERT INTO timeline_nodes (id, incident_id, occurred_at, description, source_type, service_name, created_by, sequence)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [node3_2, incident3Id, new Date(createdTime.getTime() + 2 * 60 * 1000).toISOString(),
+    'Redis认证集群连接数异常飙升，达到连接上限', 'log', 'auth-redis', 'bob', 1]);
 
   try {
     seedDemoOncallData(db, uuidv4);

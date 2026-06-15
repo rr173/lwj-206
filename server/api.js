@@ -3,6 +3,7 @@ const { getDb, runQuery, runExec } = require('./db');
 const signatureEngine = require('./signatureEngine');
 const serviceHealthEngine = require('./serviceHealthEngine');
 const oncallEngine = require('./oncallEngine');
+const slaEngine = require('./slaEngine');
 
 const pendingMatching = new Set();
 
@@ -1063,6 +1064,127 @@ function triggerAsyncMatching(db, wss, incidentId) {
       res.json(dispatches);
     } catch (e) {
       console.error('get oncall dispatches error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/sla/rules', (req, res) => {
+    try {
+      const rules = slaEngine.getAllRules(req.db);
+      res.json(rules);
+    } catch (e) {
+      console.error('get sla rules error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/sla/rules/:severity', (req, res) => {
+    try {
+      const rule = slaEngine.getRuleBySeverity(req.db, req.params.severity);
+      if (!rule) return res.status(404).json({ error: 'rule not found' });
+      res.json(rule);
+    } catch (e) {
+      console.error('get sla rule error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  function toMin(v, fallbackV) {
+    if (v !== undefined && v !== null) {
+      const n = Number(v);
+      if (Number.isInteger(n) && n > 0) return n;
+    }
+    if (fallbackV !== undefined && fallbackV !== null) {
+      const n = Number(fallbackV);
+      if (Number.isInteger(n) && n > 0) return n;
+    }
+    return undefined;
+  }
+
+  router.post('/sla/rules', (req, res) => {
+    try {
+      const b = req.body || {};
+      const fr = toMin(b.firstResponseMinutes, b.first_response_minutes || b.first_response_min);
+      const es = toMin(b.escalationMinutes, b.escalation_minutes || b.stage_escalation_minutes || b.stage_escalation_min);
+      const cl = toMin(b.closureMinutes, b.closure_minutes || b.close_minutes || b.close_min);
+      const rule = slaEngine.createRule(req.db, req.uuidv4, {
+        severity: b.severity,
+        firstResponseMinutes: fr,
+        escalationMinutes: es,
+        closureMinutes: cl
+      });
+      res.status(201).json(rule);
+    } catch (e) {
+      console.error('create sla rule error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.put('/sla/rules/:severity', (req, res) => {
+    try {
+      const b = req.body || {};
+      const fr = toMin(b.firstResponseMinutes, b.first_response_minutes || b.first_response_min);
+      const es = toMin(b.escalationMinutes, b.escalation_minutes || b.stage_escalation_minutes || b.stage_escalation_min);
+      const cl = toMin(b.closureMinutes, b.closure_minutes || b.close_minutes || b.close_min);
+      const rule = slaEngine.updateRule(req.db, req.params.severity, {
+        firstResponseMinutes: fr,
+        escalationMinutes: es,
+        closureMinutes: cl
+      });
+      res.json(rule);
+    } catch (e) {
+      console.error('update sla rule error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.delete('/sla/rules/:severity', (req, res) => {
+    try {
+      slaEngine.deleteRule(req.db, req.params.severity);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('delete sla rule error:', e);
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  router.get('/sla/incidents/:incidentId/status', (req, res) => {
+    try {
+      const incident = runQuery(req.db, 'SELECT * FROM incidents WHERE id = ?', [req.params.incidentId])[0];
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const status = slaEngine.getIncidentSlaStatus(req.db, incident);
+      res.json(status);
+    } catch (e) {
+      console.error('get incident sla status error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/sla/incidents/batch', (req, res) => {
+    try {
+      const { ids } = req.query;
+      if (!ids) {
+        const incidents = runQuery(req.db, 'SELECT * FROM incidents ORDER BY created_at DESC');
+        const statuses = slaEngine.getBatchSlaStatus(req.db, incidents);
+        return res.json(statuses);
+      }
+      const idList = Array.isArray(ids) ? ids : ids.split(',');
+      const placeholders = idList.map(() => '?').join(',');
+      const incidents = runQuery(req.db, `SELECT * FROM incidents WHERE id IN (${placeholders})`, idList);
+      const statuses = slaEngine.getBatchSlaStatus(req.db, incidents);
+      res.json(statuses);
+    } catch (e) {
+      console.error('get batch sla status error:', e);
+      res.status(500).json({ error: 'internal error' });
+    }
+  });
+
+  router.get('/sla/violations/:incidentId', (req, res) => {
+    try {
+      const violations = slaEngine.getViolationsForIncident(req.db, req.params.incidentId);
+      res.json(violations);
+    } catch (e) {
+      console.error('get sla violations error:', e);
       res.status(500).json({ error: 'internal error' });
     }
   });

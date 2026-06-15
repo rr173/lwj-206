@@ -505,6 +505,7 @@ module.exports = {
   deletePlan,
   getPlanById,
   getAllPlans,
+  getPlanMembers,
   createSwap,
   getSwapsForPlan,
   recordDispatch,
